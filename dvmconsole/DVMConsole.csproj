@@ -7,11 +7,10 @@
     <Deterministic>False</Deterministic>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
-    <Platforms>AnyCPU;x64;x86</Platforms>
+    <Platforms>AnyCPU;x64;x86;ARM64</Platforms>
     <Configurations>Debug;Release;WIN32</Configurations>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Copyright>Copyright (c) 2025 Caleb, K4PHP and DVMProject (https://github.com/dvmproject) Authors.</Copyright>
-    <PlatformTarget>x86</PlatformTarget>
     <PackageLicenseExpression>AGPL-3.0-only</PackageLicenseExpression>
     <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
     <Title>Digital Voice Modem - Desktop Dispatch Console</Title>
@@ -25,6 +24,24 @@
     <RepositoryType>git</RepositoryType>
     <AssemblyVersion>1.0.*</AssemblyVersion>
   </PropertyGroup>
+
+  <!-- Target architecture follows the selected platform; default remains x86 (needed for the 32-bit AMBE.DLL). -->
+  <PropertyGroup>
+    <PlatformTarget>x86</PlatformTarget>
+    <PlatformTarget Condition="'$(Platform)' == 'x64'">x64</PlatformTarget>
+    <PlatformTarget Condition="'$(Platform)' == 'ARM64'">ARM64</PlatformTarget>
+    <PlatformTarget Condition="'$(RuntimeIdentifier)' == 'win-x64'">x64</PlatformTarget>
+    <PlatformTarget Condition="'$(RuntimeIdentifier)' == 'win-arm64'">ARM64</PlatformTarget>
+    <NativeArch>$(PlatformTarget)</NativeArch>
+  </PropertyGroup>
+
+  <!-- Optional: drop a prebuilt libvocoder.dll into native\<arch>\ and it is copied next to the exe. -->
+  <ItemGroup>
+    <None Include="native\$(NativeArch)\libvocoder.dll" Condition="Exists('native\$(NativeArch)\libvocoder.dll')">
+      <Link>libvocoder.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 
   <ItemGroup>
     <None Remove="alerttone.png" />

@@ -12,6 +12,7 @@
 */
 
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using fnecore;
 
@@ -33,6 +34,43 @@ namespace dvmconsole
         private byte[] decoderState;
         private const int ENCSTATE_SIZE = 6144;
         private byte[] encoderState;
+
+        /// <summary>
+        /// Checks whether the given native DLL was built for the same CPU architecture as the running process.
+        /// A mismatched DLL (e.g. the 32-bit x86 AMBE.DLL inside an ARM64 or x64 process) cannot be loaded.
+        /// </summary>
+        /// <param name="dllPath">Full path to the native DLL.</param>
+        /// <returns>True if the DLL's PE machine type matches the process architecture.</returns>
+        public static bool IsLoadableInProcess(string dllPath)
+        {
+            ushort expected = RuntimeInformation.ProcessArchitecture switch
+            {
+                Architecture.X86 => 0x014C,
+                Architecture.X64 => 0x8664,
+                Architecture.Arm64 => 0xAA64,
+                _ => 0
+            };
+
+            try
+            {
+                using (FileStream fs = File.OpenRead(dllPath))
+                using (BinaryReader br = new BinaryReader(fs))
+                {
+                    if (br.ReadUInt16() != 0x5A4D) // "MZ"
+                        return false;
+                    fs.Seek(0x3C, SeekOrigin.Begin);
+                    int peOffset = br.ReadInt32();
+                    fs.Seek(peOffset, SeekOrigin.Begin);
+                    if (br.ReadUInt32() != 0x00004550) // "PE\0\0"
+                        return false;
+                    return br.ReadUInt16() == expected;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
 
         /// <summary>
         /// 

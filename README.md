@@ -24,6 +24,14 @@ The DDC software requires the library dependencies listed below. Generally, the 
 
 Please note that while x64 CPU types are supported, the dvmvocoder library must be compiled separately for that architecture.
 
+### Windows on ARM64
+
+1. Build dvmvocoder for ARM64 (`cmake -S dvmvocoder -B build -A ARM64` then `cmake --build build --config Release`).
+2. Copy the resulting `libvocoder.dll` to `dvmconsole\native\ARM64\` (it is copied next to the exe automatically).
+3. Select "ARM64" as the CPU type in Visual Studio, or run `dotnet publish dvmconsole\DVMConsole.csproj -c Release -r win-arm64 --self-contained true`.
+
+The external AMBE.DLL (DVSI USB-3000) interface is 32-bit x86 only and is automatically disabled in ARM64 and x64 builds, even if the DLL is present.
+
 ## dvmconsole Configuration
 
 1. **Create/Edit `codeplug.yml`**  
