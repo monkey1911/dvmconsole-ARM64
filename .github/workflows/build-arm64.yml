@@ -22,7 +22,7 @@ jobs:
           repository: DVMProject/dvmvocoder
           path: dvmvocoder
 
-      - name: Setup .NET 8
+      - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
@@ -39,6 +39,21 @@ jobs:
         shell: pwsh
         run: |
           dotnet publish dvmconsole/DVMConsole.csproj -c Release -r win-arm64 --self-contained true -o out/dvmconsole-win-arm64
+
+      - name: Verify ARM64 binaries
+        shell: pwsh
+        run: |
+          function Get-Machine($path) {
+            $b = [IO.File]::ReadAllBytes($path)
+            $pe = [BitConverter]::ToInt32($b, 0x3C)
+            '{0:X4}' -f [BitConverter]::ToUInt16($b, $pe + 4)
+          }
+          foreach ($f in 'DVMConsole.exe', 'libvocoder.dll') {
+            if (-not (Test-Path "out/dvmconsole-win-arm64/$f")) { Write-Error "$f missing from publish output"; exit 1 }
+            $m = Get-Machine "out/dvmconsole-win-arm64/$f"
+            Write-Host "$f machine = 0x$m"
+            if ($m -ne 'AA64') { Write-Error "$f is not ARM64"; exit 1 }
+          }
 
       - name: Upload build
         uses: actions/upload-artifact@v4

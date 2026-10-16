@@ -72,7 +72,7 @@ jobs:
           repository: DVMProject/dvmvocoder
           path: dvmvocoder
 
-      - name: Setup .NET 8
+      - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
@@ -109,6 +109,7 @@ jobs:
             '{0:X4}' -f [BitConverter]::ToUInt16($b, $pe + 4)
           }
           foreach ($f in 'DVMConsole.exe', 'libvocoder.dll') {
+            if (-not (Test-Path "out/$env:PKG/$f")) { Write-Error "$f missing from publish output"; exit 1 }
             $m = Get-Machine "out/$env:PKG/$f"
             Write-Host "$f machine = 0x$m"
             if ($m -ne 'AA64') { Write-Error "$f is not ARM64"; exit 1 }
