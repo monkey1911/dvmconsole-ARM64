@@ -7,11 +7,10 @@
     <Deterministic>False</Deterministic>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
-    <Platforms>AnyCPU;x64;x86</Platforms>
+    <Platforms>AnyCPU;x64;x86;ARM64</Platforms>
     <Configurations>Debug;Release;WIN32</Configurations>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Copyright>Copyright (c) 2025 Caleb, K4PHP and DVMProject (https://github.com/dvmproject) Authors.</Copyright>
-    <PlatformTarget>x86</PlatformTarget>
     <PackageLicenseExpression>AGPL-3.0-only</PackageLicenseExpression>
     <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
     <Title>Digital Voice Modem - Desktop Dispatch Console</Title>
@@ -26,6 +25,15 @@
     <AssemblyVersion>2.0.0.0</AssemblyVersion>
     <FileVersion>2.0.0.0</FileVersion>
     <AssemblyInformationalVersion>R02A00 ($(SourceRevisionId))</AssemblyInformationalVersion>
+  </PropertyGroup>
+
+  <!-- Target architecture follows the selected platform / runtime; default remains x86 (needed for the 32-bit AMBE.DLL). -->
+  <PropertyGroup>
+    <PlatformTarget>x86</PlatformTarget>
+    <PlatformTarget Condition="'$(Platform)' == 'x64'">x64</PlatformTarget>
+    <PlatformTarget Condition="'$(Platform)' == 'ARM64'">ARM64</PlatformTarget>
+    <PlatformTarget Condition="'$(RuntimeIdentifier)' == 'win-x64'">x64</PlatformTarget>
+    <PlatformTarget Condition="'$(RuntimeIdentifier)' == 'win-arm64'">ARM64</PlatformTarget>
   </PropertyGroup>
 
   <ItemGroup>
@@ -211,6 +219,14 @@
     <VocoderSourceDirectory Condition="'$(VocoderSourceDirectory)' == '' And Exists('$(ProjectDir)bin\$(Platform)\$(Configuration)\net8.0-windows7.0\libvocoder.dll')">$(ProjectDir)bin\$(Platform)\$(Configuration)\net8.0-windows7.0\</VocoderSourceDirectory>
     <VocoderSourceDirectory Condition="'$(VocoderSourceDirectory)' == '' And Exists('$(ProjectDir)bin\x86\Release\net8.0-windows7.0\libvocoder.dll')">$(ProjectDir)bin\x86\Release\net8.0-windows7.0\</VocoderSourceDirectory>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="Native\$(PlatformTarget)\libvocoder.dll" Condition="Exists('Native\$(PlatformTarget)\libvocoder.dll')">
+      <Link>libvocoder.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
 
   <Target Name="CopyLocalVocoderRuntime" AfterTargets="Build" Condition="'$(VocoderSourceDirectory)' != ''">
     <ItemGroup>

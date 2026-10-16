@@ -1,0 +1,47 @@
+name: Build (Windows ARM64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, dev ]
+
+jobs:
+  build-arm64:
+    # Native Windows 11 ARM64 runner (free for public repositories)
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Checkout dvmconsole
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Checkout dvmvocoder
+        uses: actions/checkout@v4
+        with:
+          repository: DVMProject/dvmvocoder
+          path: dvmvocoder
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build libvocoder (ARM64, MSVC)
+        shell: pwsh
+        run: |
+          cmake -S dvmvocoder -B dvmvocoder/build -A ARM64
+          cmake --build dvmvocoder/build --config Release
+          New-Item -ItemType Directory -Force dvmconsole/Native/ARM64 | Out-Null
+          Copy-Item (Get-ChildItem dvmvocoder/build -Recurse -Filter libvocoder.dll | Select-Object -First 1).FullName dvmconsole/Native/ARM64/
+
+      - name: Publish dvmconsole (win-arm64, self-contained)
+        shell: pwsh
+        run: |
+          dotnet publish dvmconsole/DVMConsole.csproj -c Release -r win-arm64 --self-contained true -o out/dvmconsole-win-arm64
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: dvmconsole-win-arm64
+          path: out/dvmconsole-win-arm64

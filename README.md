@@ -53,6 +53,14 @@ dotnet build .\dvmconsole.sln
 
 If building for a different CPU architecture, `libvocoder.DLL` must be built for that same architecture.
 
+### Windows on ARM64
+
+1. Build dvmvocoder for ARM64 (`cmake -S dvmvocoder -B build -A ARM64` then `cmake --build build --config Release`).
+2. Copy the resulting `libvocoder.dll` to `dvmconsole\Native\ARM64\` (it is copied next to the exe on build and publish).
+3. Select "ARM64" as the platform in Visual Studio, or run `dotnet publish dvmconsole\DVMConsole.csproj -c Release -r win-arm64 --self-contained true`.
+
+The external AMBE.DLL (DVSI USB-3000) interface is 32-bit x86 only and is automatically disabled in ARM64 and x64 builds, even if the DLL is present.
+
 ## Documentation
 
 The same documentation is also built into the app under `Help > Documentation`.
