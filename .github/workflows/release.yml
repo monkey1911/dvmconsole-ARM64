@@ -1,0 +1,137 @@
+name: Release (Windows ARM64)
+
+# Publishes a GitHub Release containing a self-contained win-arm64 build.
+#
+# Two ways to cut a release:
+#   1. Push a version tag:   git tag v1.0.0 && git push origin v1.0.0
+#   2. Actions tab -> "Release (Windows ARM64)" -> Run workflow, and enter a tag
+#      (the tag is created on the selected branch's latest commit).
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create (e.g. v1.0.0)'
+        required: true
+      prerelease:
+        description: 'Mark as pre-release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-11-arm
+
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
+      PKG: dvmconsole-${{ github.event.inputs.tag || github.ref_name }}-win-arm64
+
+    steps:
+      - name: Checkout dvmconsole
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Checkout dvmvocoder
+        uses: actions/checkout@v4
+        with:
+          repository: DVMProject/dvmvocoder
+          path: dvmvocoder
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Check release does not already exist
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$env:TAG" --repo "$env:GITHUB_REPOSITORY" 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "Release $env:TAG already exists. Delete it or choose a new tag."
+            exit 1
+          }
+          exit 0
+
+      - name: Build libvocoder (ARM64, MSVC)
+        shell: pwsh
+        run: |
+          cmake -S dvmvocoder -B dvmvocoder/build -A ARM64
+          cmake --build dvmvocoder/build --config Release
+          New-Item -ItemType Directory -Force dvmconsole/native/ARM64 | Out-Null
+          Copy-Item (Get-ChildItem dvmvocoder/build -Recurse -Filter libvocoder.dll | Select-Object -First 1).FullName dvmconsole/native/ARM64/
+
+      - name: Publish dvmconsole (win-arm64, self-contained)
+        shell: pwsh
+        run: |
+          $ver = $env:TAG.TrimStart('v')
+          dotnet publish dvmconsole/DVMConsole.csproj -c Release -r win-arm64 --self-contained true `
+            -p:InformationalVersion=$ver -o "out/$env:PKG"
+
+      - name: Add example configs and docs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "out/$env:PKG/configs" | Out-Null
+          Copy-Item configs/* "out/$env:PKG/configs/"
+          Copy-Item README.md, LICENSE "out/$env:PKG/"
+
+      - name: Verify ARM64 binaries
+        shell: pwsh
+        run: |
+          function Get-Machine($path) {
+            $b = [IO.File]::ReadAllBytes($path)
+            $pe = [BitConverter]::ToInt32($b, 0x3C)
+            '{0:X4}' -f [BitConverter]::ToUInt16($b, $pe + 4)
+          }
+          foreach ($f in 'DVMConsole.exe', 'libvocoder.dll') {
+            $m = Get-Machine "out/$env:PKG/$f"
+            Write-Host "$f machine = 0x$m"
+            if ($m -ne 'AA64') { Write-Error "$f is not ARM64"; exit 1 }
+          }
+
+      - name: Zip package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "out/$env:PKG" -DestinationPath "out/$env:PKG.zip"
+          (Get-FileHash "out/$env:PKG.zip" -Algorithm SHA256).Hash.ToLower() + "  $env:PKG.zip" |
+            Out-File -Encoding ascii "out/$env:PKG.zip.sha256"
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @"
+          Native Windows on ARM64 build of the DVM Desktop Dispatch Console.
+
+          **Install:** unzip anywhere and run ``DVMConsole.exe``. The build is self-contained (no .NET install needed) and includes the ARM64 software vocoder (``libvocoder.dll``).
+
+          **Setup:** example ``codeplug``, ``alias`` and ``keys`` files are in the ``configs`` folder. Use **Open Codeplug** to load yours.
+
+          **Note:** the external AMBE.DLL (DVSI USB-3000) interface is 32-bit x86 only and is automatically disabled in this build; the software vocoder is used instead.
+
+          Built from commit $env:GITHUB_SHA.
+          "@ | Out-File -Encoding utf8 out/notes.md
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ghArgs = @("$env:TAG", "out/$env:PKG.zip", "out/$env:PKG.zip.sha256",
+                    "--repo", "$env:GITHUB_REPOSITORY",
+                    "--title", "dvmconsole $env:TAG (Windows ARM64)",
+                    "--notes-file", "out/notes.md",
+                    "--target", "$env:GITHUB_SHA")
+          if ($env:PRERELEASE -eq 'true') { $ghArgs += '--prerelease' }
+          gh release create @args
