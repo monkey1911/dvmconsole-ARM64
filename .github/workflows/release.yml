@@ -1,22 +1,30 @@
 name: Release (Windows ARM64)
 
-# Publishes a GitHub Release containing a self-contained win-arm64 build.
+# Builds a self-contained win-arm64 package and attaches it to a GitHub Release.
 #
-# Two ways to cut a release:
-#   1. Push a version tag:   git tag v1.0.0 && git push origin v1.0.0
-#   2. Actions tab -> "Release (Windows ARM64)" -> Run workflow, and enter a tag
-#      (the tag is created on the selected branch's latest commit).
+# Ways to trigger it:
+#   1. Create/publish a release in the GitHub UI (new or existing tag)
+#      -> the build is attached to that release.
+#   2. Push a version tag:  git tag v1.0.0 && git push origin v1.0.0
+#      -> a release is created (or updated) with the build.
+#   3. Actions tab -> "Release (Windows ARM64)" -> Run workflow, enter a tag
+#      -> builds that tag if it exists (or the selected branch if it doesn't)
+#         and creates/updates the release. Use this to (re)build an old release.
+#
+# The workflow file must exist in the commit the tag points at for (1) and (2).
 
 on:
+  release:
+    types: [ published ]
   push:
     tags: [ 'v*' ]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to create (e.g. v1.0.0)'
+        description: 'Release tag (e.g. v1.0.0). Existing tag = rebuild it; new tag = created on the selected branch.'
         required: true
       prerelease:
-        description: 'Mark as pre-release'
+        description: 'Mark as pre-release (only used when creating a new release)'
         type: boolean
         default: false
 
@@ -24,7 +32,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-${{ github.event.release.tag_name || github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -32,15 +40,31 @@ jobs:
     runs-on: windows-11-arm
 
     env:
-      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref_name }}
       PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
-      PKG: dvmconsole-${{ github.event.inputs.tag || github.ref_name }}-win-arm64
+      PKG: dvmconsole-${{ github.event.release.tag_name || github.event.inputs.tag || github.ref_name }}-win-arm64
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout dvmconsole
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          fetch-depth: 0
+
+      - name: Check out the release tag (if it exists) and submodules
+        shell: pwsh
+        run: |
+          git fetch --tags --force origin
+          git rev-parse -q --verify "refs/tags/$env:TAG" | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Building existing tag $env:TAG"
+            git checkout --quiet "refs/tags/$env:TAG"
+          } else {
+            Write-Host "Tag $env:TAG does not exist yet; building $env:GITHUB_REF_NAME"
+          }
+          git submodule update --init --recursive
+          "BUILD_SHA=$(git rev-parse HEAD)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          exit 0
 
       - name: Checkout dvmvocoder
         uses: actions/checkout@v4
@@ -52,18 +76,6 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-
-      - name: Check release does not already exist
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view "$env:TAG" --repo "$env:GITHUB_REPOSITORY" 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Error "Release $env:TAG already exists. Delete it or choose a new tag."
-            exit 1
-          }
-          exit 0
 
       - name: Build libvocoder (ARM64, MSVC)
         shell: pwsh
@@ -79,6 +91,7 @@ jobs:
           $ver = $env:TAG.TrimStart('v')
           dotnet publish dvmconsole/DVMConsole.csproj -c Release -r win-arm64 --self-contained true `
             -p:InformationalVersion=$ver -o "out/$env:PKG"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Add example configs and docs
         shell: pwsh
@@ -120,18 +133,32 @@ jobs:
 
           **Note:** the external AMBE.DLL (DVSI USB-3000) interface is 32-bit x86 only and is automatically disabled in this build; the software vocoder is used instead.
 
-          Built from commit $env:GITHUB_SHA.
+          Built from commit $env:BUILD_SHA.
           "@ | Out-File -Encoding utf8 out/notes.md
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          $ghArgs = @("$env:TAG", "out/$env:PKG.zip", "out/$env:PKG.zip.sha256",
-                    "--repo", "$env:GITHUB_REPOSITORY",
-                    "--title", "dvmconsole $env:TAG (Windows ARM64)",
-                    "--notes-file", "out/notes.md",
-                    "--target", "$env:GITHUB_SHA")
-          if ($env:PRERELEASE -eq 'true') { $ghArgs += '--prerelease' }
-          gh release create @args
+          $assets = @("out/$env:PKG.zip", "out/$env:PKG.zip.sha256")
+
+          $existing = gh release view "$env:TAG" --repo "$env:GITHUB_REPOSITORY" --json body 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $env:TAG exists; uploading assets"
+            gh release upload "$env:TAG" @assets --repo "$env:GITHUB_REPOSITORY" --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+            # only fill in notes if the release was created without any
+            if ([string]::IsNullOrWhiteSpace(($existing | ConvertFrom-Json).body)) {
+              gh release edit "$env:TAG" --repo "$env:GITHUB_REPOSITORY" --notes-file out/notes.md
+            }
+          } else {
+            Write-Host "Creating release $env:TAG"
+            $ghArgs = @("$env:TAG") + $assets + @(
+                      "--repo", "$env:GITHUB_REPOSITORY",
+                      "--title", "dvmconsole $env:TAG (Windows ARM64)",
+                      "--notes-file", "out/notes.md",
+                      "--target", "$env:BUILD_SHA")
+            if ($env:PRERELEASE -eq 'true') { $ghArgs += '--prerelease' }
+            gh release create @ghArgs
+          }
+          exit $LASTEXITCODE
