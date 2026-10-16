@@ -1,0 +1,164 @@
+name: Release (Windows ARM64)
+
+# Builds a self-contained win-arm64 package and attaches it to a GitHub Release.
+#
+# Ways to trigger it:
+#   1. Create/publish a release in the GitHub UI (new or existing tag)
+#      -> the build is attached to that release.
+#   2. Push a version tag:  git tag v1.0.0 && git push origin v1.0.0
+#      -> a release is created (or updated) with the build.
+#   3. Actions tab -> "Release (Windows ARM64)" -> Run workflow, enter a tag
+#      -> builds that tag if it exists (or the selected branch if it doesn't)
+#         and creates/updates the release. Use this to (re)build an old release.
+#
+# The workflow file must exist in the commit the tag points at for (1) and (2).
+
+on:
+  release:
+    types: [ published ]
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0). Existing tag = rebuild it; new tag = created on the selected branch.'
+        required: true
+      prerelease:
+        description: 'Mark as pre-release (only used when creating a new release)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-11-arm
+
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref_name }}
+      PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
+      PKG: dvmconsole-${{ github.event.release.tag_name || github.event.inputs.tag || github.ref_name }}-win-arm64
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout dvmconsole
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out the release tag (if it exists) and submodules
+        shell: pwsh
+        run: |
+          git fetch --tags --force origin
+          git rev-parse -q --verify "refs/tags/$env:TAG" | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Building existing tag $env:TAG"
+            git checkout --quiet "refs/tags/$env:TAG"
+          } else {
+            Write-Host "Tag $env:TAG does not exist yet; building $env:GITHUB_REF_NAME"
+          }
+          git submodule update --init --recursive
+          "BUILD_SHA=$(git rev-parse HEAD)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          exit 0
+
+      - name: Checkout dvmvocoder
+        uses: actions/checkout@v4
+        with:
+          repository: DVMProject/dvmvocoder
+          path: dvmvocoder
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build libvocoder (ARM64, MSVC)
+        shell: pwsh
+        run: |
+          cmake -S dvmvocoder -B dvmvocoder/build -A ARM64
+          cmake --build dvmvocoder/build --config Release
+          New-Item -ItemType Directory -Force dvmconsole/native/ARM64 | Out-Null
+          Copy-Item (Get-ChildItem dvmvocoder/build -Recurse -Filter libvocoder.dll | Select-Object -First 1).FullName dvmconsole/native/ARM64/
+
+      - name: Publish dvmconsole (win-arm64, self-contained)
+        shell: pwsh
+        run: |
+          $ver = $env:TAG.TrimStart('v')
+          dotnet publish dvmconsole/DVMConsole.csproj -c Release -r win-arm64 --self-contained true `
+            -p:InformationalVersion=$ver -o "out/$env:PKG"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Add example configs and docs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "out/$env:PKG/configs" | Out-Null
+          Copy-Item configs/* "out/$env:PKG/configs/"
+          Copy-Item README.md, LICENSE "out/$env:PKG/"
+
+      - name: Verify ARM64 binaries
+        shell: pwsh
+        run: |
+          function Get-Machine($path) {
+            $b = [IO.File]::ReadAllBytes($path)
+            $pe = [BitConverter]::ToInt32($b, 0x3C)
+            '{0:X4}' -f [BitConverter]::ToUInt16($b, $pe + 4)
+          }
+          foreach ($f in 'DVMConsole.exe', 'libvocoder.dll') {
+            $m = Get-Machine "out/$env:PKG/$f"
+            Write-Host "$f machine = 0x$m"
+            if ($m -ne 'AA64') { Write-Error "$f is not ARM64"; exit 1 }
+          }
+
+      - name: Zip package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "out/$env:PKG" -DestinationPath "out/$env:PKG.zip"
+          (Get-FileHash "out/$env:PKG.zip" -Algorithm SHA256).Hash.ToLower() + "  $env:PKG.zip" |
+            Out-File -Encoding ascii "out/$env:PKG.zip.sha256"
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @"
+          Native Windows on ARM64 build of the DVM Desktop Dispatch Console.
+
+          **Install:** unzip anywhere and run ``DVMConsole.exe``. The build is self-contained (no .NET install needed) and includes the ARM64 software vocoder (``libvocoder.dll``).
+
+          **Setup:** example ``codeplug``, ``alias`` and ``keys`` files are in the ``configs`` folder. Use **Open Codeplug** to load yours.
+
+          **Note:** the external AMBE.DLL (DVSI USB-3000) interface is 32-bit x86 only and is automatically disabled in this build; the software vocoder is used instead.
+
+          Built from commit $env:BUILD_SHA.
+          "@ | Out-File -Encoding utf8 out/notes.md
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        run: |
+          $assets = @("out/$env:PKG.zip", "out/$env:PKG.zip.sha256")
+
+          $existing = gh release view "$env:TAG" --repo "$env:GITHUB_REPOSITORY" --json body 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $env:TAG exists; uploading assets"
+            gh release upload "$env:TAG" @assets --repo "$env:GITHUB_REPOSITORY" --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+            # only fill in notes if the release was created without any
+            if ([string]::IsNullOrWhiteSpace(($existing | ConvertFrom-Json).body)) {
+              gh release edit "$env:TAG" --repo "$env:GITHUB_REPOSITORY" --notes-file out/notes.md
+            }
+          } else {
+            Write-Host "Creating release $env:TAG"
+            $ghArgs = @("$env:TAG") + $assets + @(
+                      "--repo", "$env:GITHUB_REPOSITORY",
+                      "--title", "dvmconsole $env:TAG (Windows ARM64)",
+                      "--notes-file", "out/notes.md",
+                      "--target", "$env:BUILD_SHA")
+            if ($env:PRERELEASE -eq 'true') { $ghArgs += '--prerelease' }
+            gh release create @ghArgs
+          }
+          exit $LASTEXITCODE
