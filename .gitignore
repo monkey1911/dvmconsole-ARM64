@@ -403,3 +403,7 @@ FodyWeavers.xsd
 
 # VS telemetry/session junk
 *.trn
+# Proprietary external vocoder; never commit or ship it
+[Aa][Mm][Bb][Ee].[Dd][Ll][Ll]
+# AmbeHost build output
+build-ambehost/

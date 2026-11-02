@@ -59,7 +59,14 @@ If building for a different CPU architecture, `libvocoder.DLL` must be built for
 2. Copy the resulting `libvocoder.dll` to `dvmconsole\Native\ARM64\` (it is copied next to the exe on build and publish).
 3. Select "ARM64" as the platform in Visual Studio, or run `dotnet publish dvmconsole\DVMConsole.csproj -c Release -r win-arm64 --self-contained true`.
 
-The external AMBE.DLL (DVSI USB-3000) interface is 32-bit x86 only and is automatically disabled in ARM64 and x64 builds, even if the DLL is present.
+### External AMBE vocoder on x64 and ARM64
+
+`AMBE.DLL` is a 32-bit x86 software vocoder library, so x64 and ARM64 builds cannot load it directly. Those builds use it through `AmbeHost.exe`, a small 32-bit x86 helper (source in `tools/AmbeHost`) that loads `AMBE.DLL` and serves encode/decode requests over a named pipe. On Windows on ARM the helper runs under the built-in x86 emulation.
+
+1. Build the helper as 32-bit x86: `cmake -S tools/AmbeHost -B build-ambehost -A Win32` then `cmake --build build-ambehost --config Release`.
+2. Put `AmbeHost.exe` and your own `AMBE.DLL` next to `DVMConsole.exe`.
+
+x86 builds keep loading `AMBE.DLL` in-process and do not need the helper. If either file is missing, the console uses the built-in software vocoder. `AMBE.DLL` is proprietary and is not distributed with this project.
 
 ## Documentation
 

@@ -21,11 +21,15 @@ namespace dvmconsole
     /// <summary>
     /// Implements P/Invoke to callback into external AMBE encoder/decoder library.
     /// </summary>
-    /// <remarks>This is used to interface to a external library that talks to a DVSI USB-3000.</remarks>
+    /// <remarks>
+    /// AMBE.DLL is a 32-bit x86 software vocoder library. x86 builds call it in-process; x64 and ARM64
+    /// builds call it through the AmbeHost.exe helper process (see <see cref="AmbeHostClient"/>).
+    /// </remarks>
     public class AmbeVocoder
     {
         private const int MBE_SAMPLES_LENGTH = 160;
         private const short NO_BIT_STEAL = 0;
+        private const short ENC_UNK = 8192;
 
         private const ushort ECMODE_NOISE_SUPPRESS = 0x40;
         private const ushort ECMODE_AGC = 0x2000;
@@ -34,6 +38,31 @@ namespace dvmconsole
         private byte[] decoderState;
         private const int ENCSTATE_SIZE = 6144;
         private byte[] encoderState;
+
+        private static readonly string appDirectory = AppContext.BaseDirectory;
+        private static readonly Lazy<bool> inProcess = new Lazy<bool>(() =>
+            IsLoadableInProcess(Path.Combine(appDirectory, "AMBE.DLL")));
+        private static int hostFailureLogged;
+        private static long hostRetryAtTicks;
+        private const int HOST_RETRY_SECONDS = 30;
+
+        private readonly bool fullRate;
+        private AmbeHostClient host;
+        private uint hostId;
+
+        /// <summary>
+        /// Returns true if the external AMBE vocoder can be used from this process: AMBE.DLL is present and
+        /// either loads in-process or AmbeHost.exe is present to host it.
+        /// </summary>
+        /// <param name="directory">Folder containing AMBE.DLL (and AmbeHost.exe for x64/ARM64 builds).</param>
+        public static bool IsAvailable(string directory)
+        {
+            string dllPath = Path.Combine(directory, "AMBE.DLL");
+            if (!File.Exists(dllPath))
+                return false;
+
+            return IsLoadableInProcess(dllPath) || AmbeHostClient.IsHostPresent(directory);
+        }
 
         /// <summary>
         /// Checks whether the given native DLL was built for the same CPU architecture as the running process.
@@ -103,6 +132,9 @@ namespace dvmconsole
         {
             get
             {
+                if (!inProcess.Value)
+                    return (AmbeMode)WithHost(h => h.GetDecoderMode(hostId), (short)AmbeMode.NOT_VALID);
+
                 unsafe
                 {
                     fixed (byte* state = decoderState)
@@ -118,6 +150,9 @@ namespace dvmconsole
         {
             get
             {
+                if (!inProcess.Value)
+                    return (AmbeMode)WithHost(h => h.GetEncoderMode(hostId), (short)AmbeMode.NOT_VALID);
+
                 unsafe
                 {
                     fixed (byte* state = encoderState)
@@ -150,6 +185,8 @@ namespace dvmconsole
         /// <param name="fullRate"></param>
         public AmbeVocoder(bool fullRate = true)
         {
+            this.fullRate = fullRate;
+
             if (fullRate)
             {
                 this.mode = AmbeMode.FULL_RATE;
@@ -170,6 +207,17 @@ namespace dvmconsole
 
             this.encoderState = new byte[ENCSTATE_SIZE];
             this.ecmode = ECMODE_NOISE_SUPPRESS | ECMODE_AGC;
+
+            if (!inProcess.Value)
+            {
+                // AMBE.DLL cannot load in this process (x64/ARM64); the codec state lives in AmbeHost.exe
+                this.decoderState = null;
+                this.encoderState = null;
+
+                // a failure here is retried on first use (see WithHost) so callers never see it
+                WithHost(h => true, false);
+                return;
+            }
 
             unsafe
             {
@@ -277,6 +325,13 @@ namespace dvmconsole
             short[] codewordBits = null;
             unpackBytesToBits(out codewordBits, codeword, frameLengthInBytes, frameLengthInBits);
 
+            if (!inProcess.Value)
+            {
+                // on helper failure this frame decodes to silence
+                samples = WithHost(h => h.Decode(hostId, dcmode, codewordBits), new short[MBE_SAMPLES_LENGTH]);
+                return 0;
+            }
+
             short[] n0 = new short[MBE_SAMPLES_LENGTH / 2];
             short[] n1 = new short[MBE_SAMPLES_LENGTH / 2];
 
@@ -316,14 +371,14 @@ namespace dvmconsole
         /// </summary>
         /// <param name="state">Buffer containing the decoder state to initialize.</param>
         /// <param name="mode">AMBE mode; FULL (0) or HALF (1).</param>
-        [DllImport("AMBE.DLL", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("AMBE.DLL", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern void ambe_init_dec([Out] IntPtr state, [In] short mode);
 
         /// <summary>
         /// Calls ambe_get_dec_mode() in the external DLL.
         /// </summary>
         /// <param name="state">Buffer containing the decoder state to initialize.</param>
-        [DllImport("AMBE.DLL", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("AMBE.DLL", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern short ambe_get_dec_mode([In] IntPtr state);
 
         /// <summary>
@@ -337,7 +392,7 @@ namespace dvmconsole
         /// <param name="n"></param>
         /// <param name="state">Buffer containing the decoder state.</param>
         /// <returns></returns>
-        [DllImport("AMBE.DLL", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("AMBE.DLL", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern uint ambe_voice_dec([Out] IntPtr samples, [In] short sampleLength, [In] IntPtr codeword, [In] short bitSteal, [In] ushort cmode, [In] short n, [In] IntPtr state);
 
         /// <summary>
@@ -422,6 +477,15 @@ namespace dvmconsole
 
             short[] codewordBits = new short[this.frameLengthInBits * 2];
 
+            if (!inProcess.Value)
+            {
+                // on helper failure this frame encodes as all-zero bits
+                int bitsLength = codewordBits.Length;
+                codewordBits = WithHost(h => h.Encode(hostId, ecmode, ENC_UNK, samples, bitsLength), codewordBits);
+            }
+            else
+            {
+
             // split samples into 2 segments
             short[] n0 = new short[MBE_SAMPLES_LENGTH / 2];
             for (int i = 0; i < MBE_SAMPLES_LENGTH / 2; i++)
@@ -442,16 +506,18 @@ namespace dvmconsole
                     // sample segment 1
                     GCHandle pinnedN0 = GCHandle.Alloc(n0, GCHandleType.Pinned);
                     IntPtr n0Ptr = pinnedN0.AddrOfPinnedObject();
-                    ambe_voice_enc(codewordPtr, NO_BIT_STEAL, n0Ptr, MBE_SAMPLES_LENGTH / 2, ecmode, 0, 8192, (IntPtr)state);
+                    ambe_voice_enc(codewordPtr, NO_BIT_STEAL, n0Ptr, MBE_SAMPLES_LENGTH / 2, ecmode, 0, ENC_UNK, (IntPtr)state);
                     pinnedN0.Free();
 
                     // sample segment 2
                     GCHandle pinnedN1 = GCHandle.Alloc(n1, GCHandleType.Pinned);
                     IntPtr n1Ptr = pinnedN1.AddrOfPinnedObject();
-                    ambe_voice_enc(codewordPtr, NO_BIT_STEAL, n1Ptr, MBE_SAMPLES_LENGTH / 2, ecmode, 1, 8192, (IntPtr)state);
+                    ambe_voice_enc(codewordPtr, NO_BIT_STEAL, n1Ptr, MBE_SAMPLES_LENGTH / 2, ecmode, 1, ENC_UNK, (IntPtr)state);
                     pinnedN1.Free();
                 }
             }
+
+            } // in-process
 
             // is this to be a DMR codeword?
             if (mode == AmbeMode.HALF_RATE && encodeDMR)
@@ -473,19 +539,83 @@ namespace dvmconsole
         }
 
         /// <summary>
+        /// Starts (or reuses) the AmbeHost.exe helper and creates this vocoder's state in it.
+        /// </summary>
+        private void ConnectHost()
+        {
+            long retryAt = Interlocked.Read(ref hostRetryAtTicks);
+            if (retryAt != 0 && DateTime.UtcNow.Ticks < retryAt)
+                throw new InvalidOperationException($"{AmbeHostClient.HostExeName} is unavailable; retrying later");
+
+            try
+            {
+                host = AmbeHostClient.GetShared(appDirectory);
+                hostId = host.Create(fullRate);
+                Interlocked.Exchange(ref hostRetryAtTicks, 0);
+            }
+            catch (Exception ex) when (ex is not InvalidOperationException)
+            {
+                // e.g. FileNotFoundException, Win32Exception; normalize so WithHost handles it
+                Interlocked.Exchange(ref hostRetryAtTicks, DateTime.UtcNow.AddSeconds(HOST_RETRY_SECONDS).Ticks);
+                throw new InvalidOperationException(ex.Message, ex);
+            }
+            catch (InvalidOperationException)
+            {
+                Interlocked.Exchange(ref hostRetryAtTicks, DateTime.UtcNow.AddSeconds(HOST_RETRY_SECONDS).Ticks);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Runs a request against the helper. If the helper has died, it is restarted and the request is
+        /// retried once with fresh codec state; if that also fails, <paramref name="fallback"/> is returned
+        /// so audio paths never throw.
+        /// </summary>
+        private T WithHost<T>(Func<AmbeHostClient, T> request, T fallback)
+        {
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                try
+                {
+                    if (host == null || host.IsBroken)
+                        ConnectHost();
+
+                    return request(host);
+                }
+                catch (Exception ex) when (ex is InvalidOperationException || ex is IOException || ex is TimeoutException)
+                {
+                    if (Interlocked.Exchange(ref hostFailureLogged, 1) == 0)
+                        Log.WriteWarning($"External AMBE vocoder helper ({AmbeHostClient.HostExeName}) failed: {ex.Message}");
+
+                    host = null;
+                }
+            }
+
+            return fallback;
+        }
+
+        /// <summary>
+        /// Finalizes an instance of the <see cref="AmbeVocoder"/> class, releasing its helper-side state.
+        /// </summary>
+        ~AmbeVocoder()
+        {
+            host?.QueueDestroy(hostId);
+        }
+
+        /// <summary>
         /// Calls ambe_init_enc() in the external DLL.
         /// </summary>
         /// <param name="state">Buffer containing the encoder state to initialize.</param>
         /// <param name="mode">AMBE mode; FULL (0) or HALF (1).</param>
         /// <param name="initialize">Flag to initialize encoder state fully, 1 to initialize, 0 to not.</param>
-        [DllImport("AMBE.DLL", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("AMBE.DLL", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern void ambe_init_enc([Out] IntPtr state, [In] short mode, [In] short initialize);
 
         /// <summary>
         /// Calls ambe_get_enc_mode() in the external DLL.
         /// </summary>
         /// <param name="state">Buffer containing the encoder state to initialize.</param>
-        [DllImport("AMBE.DLL", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("AMBE.DLL", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern short ambe_get_enc_mode([In] IntPtr state);
 
         /// <summary>
@@ -500,7 +630,7 @@ namespace dvmconsole
         /// <param name="unk"></param>
         /// <param name="state">Buffer containing the encoder state.</param>
         /// <returns></returns>
-        [DllImport("AMBE.DLL", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("AMBE.DLL", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern uint ambe_voice_enc([Out] IntPtr codeword, [In] short bitSteal, [In] IntPtr samples, [In] short sampleLength, [In] ushort cmode, [In] short n, [In] short unk, [In] IntPtr state);
     } // public class AmbeVocoder
 }

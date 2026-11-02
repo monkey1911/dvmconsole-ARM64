@@ -962,12 +962,10 @@ namespace dvmconsole.Controls
             // initialize external AMBE vocoder
             string path = Assembly.GetExecutingAssembly().Location;
 
-            // if the assembly executing directory contains the external DVSI USB-3000 interface DLL
-            // setup the external vocoder code
-            // (only if the DLL matches this process's CPU architecture; the stock AMBE.DLL is 32-bit x86
-            // and cannot be loaded by x64 or ARM64 builds)
-            string ambeDllPath = Path.Combine(Path.GetDirectoryName(path), "AMBE.DLL");
-            if (File.Exists(ambeDllPath) && AmbeVocoder.IsLoadableInProcess(ambeDllPath))
+            // if the assembly executing directory contains the external AMBE.DLL vocoder, setup the
+            // external vocoder code. x86 builds load the DLL directly; x64 and ARM64 builds use it
+            // through AmbeHost.exe, which must be in the same folder.
+            if (AmbeVocoder.IsAvailable(Path.GetDirectoryName(path)))
             {
                 ExternalVocoderEnabled = true;
                 ExtFullRateVocoder = new AmbeVocoder();
