@@ -85,6 +85,12 @@ jobs:
           New-Item -ItemType Directory -Force dvmconsole/Native/ARM64 | Out-Null
           Copy-Item (Get-ChildItem dvmvocoder/build -Recurse -Filter libvocoder.dll | Select-Object -First 1).FullName dvmconsole/Native/ARM64/
 
+      - name: Build AmbeHost helper (x86, MSVC)
+        shell: pwsh
+        run: |
+          cmake -S tools/AmbeHost -B build-ambehost -A Win32
+          cmake --build build-ambehost --config Release
+
       - name: Publish dvmconsole (win-arm64, self-contained)
         shell: pwsh
         run: |
@@ -96,6 +102,7 @@ jobs:
       - name: Add example configs and docs
         shell: pwsh
         run: |
+          Copy-Item build-ambehost/Release/AmbeHost.exe "out/$env:PKG/"
           New-Item -ItemType Directory -Force "out/$env:PKG/configs" | Out-Null
           Copy-Item configs/* "out/$env:PKG/configs/"
           Copy-Item README.md, LICENSE "out/$env:PKG/"
@@ -108,12 +115,15 @@ jobs:
             $pe = [BitConverter]::ToInt32($b, 0x3C)
             '{0:X4}' -f [BitConverter]::ToUInt16($b, $pe + 4)
           }
-          foreach ($f in 'DVMConsole.exe', 'libvocoder.dll') {
+          $expected = @{ 'DVMConsole.exe' = 'AA64'; 'libvocoder.dll' = 'AA64'; 'AmbeHost.exe' = '014C' }
+          foreach ($f in $expected.Keys) {
             if (-not (Test-Path "out/$env:PKG/$f")) { Write-Error "$f missing from publish output"; exit 1 }
             $m = Get-Machine "out/$env:PKG/$f"
             Write-Host "$f machine = 0x$m"
-            if ($m -ne 'AA64') { Write-Error "$f is not ARM64"; exit 1 }
+            if ($m -ne $expected[$f]) { Write-Error "$f machine 0x$m, expected 0x$($expected[$f])"; exit 1 }
           }
+          # AMBE.DLL is proprietary and must never be shipped
+          if (Get-ChildItem "out/$env:PKG" -Filter 'AMBE.dll') { Write-Error "AMBE.dll must not be in the package"; exit 1 }
 
       - name: Zip package
         shell: pwsh
@@ -132,7 +142,9 @@ jobs:
 
           **Setup:** example ``codeplug``, ``alias`` and ``keys`` files are in the ``configs`` folder. Use **Open Codeplug** to load yours.
 
-          **Note:** the external AMBE.DLL (DVSI USB-3000) interface is 32-bit x86 only and is automatically disabled in this build; the software vocoder is used instead.
+          **External AMBE vocoder (optional):** AMBE.DLL is not included. To use it, copy your own ``AMBE.DLL`` into this folder next to ``AmbeHost.exe``. The ARM64 console runs it through ``AmbeHost.exe``, a small x86 helper that Windows runs under its built-in x86 emulation. Without AMBE.DLL the built-in software vocoder is used.
+
+          **Downloaded-file warning:** right-click the zip, choose Properties, and tick **Unblock** before extracting to avoid a security prompt on every launch.
 
           Built from commit $env:BUILD_SHA.
           "@ | Out-File -Encoding utf8 out/notes.md

@@ -143,6 +143,14 @@ namespace dvmconsole.Controls
         public MBEToneDetector ToneDetector = new MBEToneDetector();
 
         public P25Crypto Crypter = new P25Crypto();
+        internal P25ReceiveCrypto ReceiveCrypto { get; } = new();
+
+        /// <summary>
+        /// Exact codeplug entry for this card; null for local playback.
+        /// </summary>
+        internal Codeplug.Channel ConfiguredChannel { get; }
+        internal bool IsLocalPlayback => ConfiguredChannel == null;
+        internal string ResourceSystemName => ConfiguredChannel?.System ?? MainWindow.PLAYBACKSYS;
 
         private bool pttToggleMode = false;
         private bool suppressSelectionToggle = false;
@@ -162,14 +170,6 @@ namespace dvmconsole.Controls
         /// Event action that handles the PTT button being clicked.
         /// </summary>
         public event EventHandler<ChannelBox> PTTButtonClicked;
-        /// <summary>
-        /// Event action that handles the PTT button being pressed.
-        /// </summary>
-        public event EventHandler<ChannelBox> PTTButtonPressed;
-        /// <summary>
-        /// Event action that handles the PTT button being released.
-        /// </summary>
-        public event EventHandler<ChannelBox> PTTButtonReleased;
         /// <summary>
         /// Event action that handles the page button being clicked.
         /// </summary>
@@ -259,7 +259,7 @@ namespace dvmconsole.Controls
         public string AudioOutputKey { get; private set; }
 
         public string ChannelSettingsKey =>
-            ChannelName == MainWindow.PLAYBACKCHNAME || DstId == MainWindow.PLAYBACKTG
+            IsLocalPlayback
                 ? MainWindow.PLAYBACKCHNAME
                 : AudioOutputKey;
 
@@ -367,8 +367,39 @@ namespace dvmconsole.Controls
             }
         }
 
+        private volatile bool pttTimedOut;
+        private Brush fixedPttBorder;
+
         /// <summary>
-        /// Flag indicating the current PTT state of this channel.
+        /// Fixed shortcut border. The primary Ctrl-click selection takes precedence.
+        /// </summary>
+        internal Brush FixedPttBorder
+        {
+            get => fixedPttBorder;
+            set { fixedPttBorder = value; UpdateBackground(); }
+        }
+
+        /// <summary>
+        /// Holds off another operator transmission until the timed-out PTT is released.
+        /// </summary>
+        internal bool PttTimedOut
+        {
+            get => pttTimedOut;
+            set
+            {
+                pttTimedOut = value;
+                UpdatePTTColor();
+                PttButton.ToolTip = value ? "Transmit timed out. Release PTT before rekeying." : "Push To Talk";
+            }
+        }
+
+        /// <summary>
+        /// Whether operator PTT is still transmitting rather than latched after timeout.
+        /// </summary>
+        internal bool IsOperatorTransmitting => PttState && !PttTimedOut;
+
+        /// <summary>
+        /// Flag indicating the current PTT input state of this channel.
         /// </summary>
         public bool PttState
         {
@@ -376,6 +407,11 @@ namespace dvmconsole.Controls
             set
             {
                 pttState = value;
+                if (!value)
+                {
+                    pttInputs.Clear();
+                    PttTimedOut = false;
+                }
                 UpdatePTTColor();
                 Dispatcher.Invoke(() => UpdateBackground());
             }
@@ -842,12 +878,27 @@ namespace dvmconsole.Controls
         /// </summary>
         /// <param name="selectedChannelsManager"></param>
         /// <param name="audioManager"></param>
-        /// <param name="channelName"></param>
-        /// <param name="systemName"></param>
-        /// <param name="dstId"></param>
+        /// <param name="channel"></param>
         /// <param name="pttToggleMode"></param>
-        public ChannelBox(SelectedChannelsManager selectedChannelsManager, AudioManager audioManager, string channelName, string systemName, string dstId, bool pttToggleMode = false)
+        public ChannelBox(SelectedChannelsManager selectedChannelsManager, AudioManager audioManager, Codeplug.Channel channel, bool pttToggleMode = false)
+            : this(selectedChannelsManager, audioManager,
+                  (channel ?? throw new ArgumentNullException(nameof(channel))).Name, channel.System, channel.Tgid, pttToggleMode, channel)
         {
+        }
+
+        /// <summary>
+        /// Initializes the local playback card without a network channel binding.
+        /// </summary>
+        /// <param name="selectedChannelsManager"></param>
+        /// <param name="audioManager"></param>
+        public ChannelBox(SelectedChannelsManager selectedChannelsManager, AudioManager audioManager)
+            : this(selectedChannelsManager, audioManager, MainWindow.PLAYBACKCHNAME, MainWindow.PLAYBACKSYS, MainWindow.PLAYBACKTG, false, null)
+        {
+        }
+
+        private ChannelBox(SelectedChannelsManager selectedChannelsManager, AudioManager audioManager, string channelName, string systemName, string dstId, bool pttToggleMode, Codeplug.Channel channel)
+        {
+            ConfiguredChannel = channel;
             InitializeComponent();
 
             this.InternalID = ChannelIdx;
@@ -896,7 +947,7 @@ namespace dvmconsole.Controls
             ApplyCardSizeLayout();
             DisableControls();
 
-            if (SystemName == MainWindow.PLAYBACKSYS || ChannelName == MainWindow.PLAYBACKCHNAME || DstId == MainWindow.PLAYBACKTG)
+            if (IsLocalPlayback)
             {
                 PttButton.IsEnabled = false;
 
@@ -911,12 +962,10 @@ namespace dvmconsole.Controls
             // initialize external AMBE vocoder
             string path = Assembly.GetExecutingAssembly().Location;
 
-            // if the assembly executing directory contains the external DVSI USB-3000 interface DLL
-            // setup the external vocoder code
-            // (only if the DLL matches this process's CPU architecture; the stock AMBE.DLL is 32-bit x86
-            // and cannot be loaded by x64 or ARM64 builds)
-            string ambeDllPath = Path.Combine(Path.GetDirectoryName(path), "AMBE.DLL");
-            if (File.Exists(ambeDllPath) && AmbeVocoder.IsLoadableInProcess(ambeDllPath))
+            // if the assembly executing directory contains the external AMBE.DLL vocoder, setup the
+            // external vocoder code. x86 builds load the DLL directly; x64 and ARM64 builds use it
+            // through AmbeHost.exe, which must be in the same folder.
+            if (AmbeVocoder.IsAvailable(Path.GetDirectoryName(path)))
             {
                 ExternalVocoderEnabled = true;
                 ExtFullRateVocoder = new AmbeVocoder();
@@ -1222,7 +1271,7 @@ namespace dvmconsole.Controls
         /// </summary>
         private void UpdatePTTColor()
         {
-            if (PttState || PatchForwardingTxState)
+            if (IsOperatorTransmitting || PatchForwardingTxState)
             {
                 if (IsTxEncrypted)
                     PttButton.Background = ORANGE_GRADIENT;
@@ -1282,7 +1331,7 @@ namespace dvmconsole.Controls
         /// </summary>
         private void UpdateBackground()
         {
-            if (SystemName == MainWindow.PLAYBACKSYS || ChannelName == MainWindow.PLAYBACKCHNAME || DstId == MainWindow.PLAYBACKTG)
+            if (IsLocalPlayback)
             {
                 SetCardBackground(IsSelected ? RED_GRADIENT : DARK_GRAY_GRADIENT);
                 return;
@@ -1301,17 +1350,9 @@ namespace dvmconsole.Controls
                 SetCardBackground(IsSelected ? ConfiguredIdleBackground : DARK_GRAY_GRADIENT);
             }
 
-            if (IsSelected)
-            {
-                if (IsPrimary)
-                    ControlBorder.BorderBrush = BORDER_GREEN.BorderBrush;
-                else
-                    ControlBorder.BorderBrush = BORDER_DEFAULT.BorderBrush;
-            }
-            else
-            {
-                ControlBorder.BorderBrush = BORDER_DEFAULT.BorderBrush;
-            }
+            ControlBorder.BorderBrush = IsSelected && IsPrimary
+                ? BORDER_GREEN.BorderBrush
+                : FixedPttBorder ?? BORDER_DEFAULT.BorderBrush;
 
         }
 
@@ -1451,14 +1492,11 @@ namespace dvmconsole.Controls
         /// <param name="pttState"></param>
         public void TriggerPTTState(bool pttState)
         {
-            if (IsRxOnly)
-                return;
-            if (!IsSelected)
-                return;
+            SetPttInput(legacyPttInput, pttState);
+        }
 
-            if (pttState && CanStartPtt != null && !CanStartPtt(this))
-                return;
-
+        private void ApplyPttState(bool pttState)
+        {
             if (pttState)
             {
                 CancelPendingPttRelease();
@@ -1579,150 +1617,30 @@ namespace dvmconsole.Controls
         /// <param name="e"></param>
         public void PttButton_Click(object sender, RoutedEventArgs e)
         {
-            if (IsRxOnly)
-                return;
-            if (!IsSelected)
-                return;
-
-            if (HasPendingPttRelease)
-            {
-                CancelPendingPttRelease();
-                return;
-            }
-
-            bool nextState = !PttState;
-            if (nextState && CanStartPtt != null && !CanStartPtt(this))
-                return;
-
-            if (nextState && IsTxEncrypted && !HasLoadedTransmitKey())
-            {
-                MessageBox.Show($"{ChannelName} {ERR_NO_LOADED_ENC_KEY}.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                PttState = false;
-                return;
-            }
-
-            if (nextState)
-            {
-                CancelPendingPttRelease();
-                PttState = true;
-                PTTButtonClicked?.Invoke(sender, this);
-                return;
-            }
-
-            if (!PttState)
-                return;
-
-            BeginPttReleaseTail(() =>
-            {
-                PttState = false;
-                PTTButtonClicked?.Invoke(sender, this);
-            });
+            SetPttInput(mousePttInput, !pttInputs.Contains(mousePttInput));
         }
 
         /// <summary>
-        /// 
+        /// Right-click latches the resource's mouse PTT in momentary mode.
         /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        /// <exception cref="NotImplementedException"></exception>
-        private async void PttButton_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
+        private void PttButton_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
         {
-            if (IsRxOnly)
-                return;
-            if (pttToggleMode)
-                return;
-
-            if (PttState)
-                await Task.Delay(500);
-
-            PttButton_Click(sender, e);
+            if (!pttToggleMode)
+                PttButton_Click(sender, e);
         }
 
         /// <summary>
-        /// 
+        /// Mouse and keyboard PTT requests remain independent.
         /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        /// <exception cref="NotImplementedException"></exception>
-        private async void PttButton_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        private void PttButton_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
-            if (IsRxOnly)
-                return;
-            if (!IsSelected)
-                return;
-
-            if (HasPendingPttRelease)
-            {
-                CancelPendingPttRelease();
-                return;
-            }
-
-            if (!PttState && IsTxEncrypted && !HasLoadedTransmitKey())
-            {
-                MessageBox.Show($"{ChannelName} {ERR_NO_LOADED_ENC_KEY}.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                PttState = false;
-                return;
-            }
-
-            if (PttState)
-                await Task.Delay(500);
-
-            if (pttToggleMode)
-            {
-                // Toggle mode: toggle PttState and invoke clicked event
-                bool nextState = !PttState;
-                if (nextState && CanStartPtt != null && !CanStartPtt(this))
-                    return;
-
-                if (nextState)
-                {
-                    CancelPendingPttRelease();
-                    PttState = true;
-                    PTTButtonClicked?.Invoke(sender, this);
-                }
-                else
-                {
-                    BeginPttReleaseTail(() =>
-                    {
-                        PttState = false;
-                        PTTButtonClicked?.Invoke(sender, this);
-                    });
-                }
-            }
-            else
-            {
-                // Normal mode: set PttState to true and invoke pressed event
-                if (CanStartPtt != null && !CanStartPtt(this))
-                    return;
-
-                CancelPendingPttRelease();
-                PTTButtonPressed?.Invoke(sender, this);
-                PttState = true;
-            }
+            SetPttInput(mousePttInput, pttToggleMode ? !pttInputs.Contains(mousePttInput) : true);
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        /// <exception cref="NotImplementedException"></exception>
         private void PttButton_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
-            if (IsRxOnly)
-                return;
-            if (pttToggleMode)
-                return;
-            if (!IsSelected)
-                return;
-            if (!PttState)
-                return;
-
-            BeginPttReleaseTail(() =>
-            {
-                PTTButtonReleased?.Invoke(sender, this);
-                PttState = false;
-            });
+            if (!pttToggleMode)
+                SetPttInput(mousePttInput, false);
         }
 
         private bool HasPendingPttRelease => pendingPttReleaseCts != null;

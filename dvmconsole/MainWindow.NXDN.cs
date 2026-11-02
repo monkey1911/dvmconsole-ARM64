@@ -49,6 +49,10 @@ namespace dvmconsole
 
         private byte[] GetNxdnKey(string system, byte cipher, ushort id)
         {
+            if (cipher is < 1 or > 3 || id is 0 or > 63)
+                return null;
+            if (localKeys != null && localKeys.TryGetKey(NXDNCrypto.ToKeyRequestAlgorithm(cipher), id, out byte[] local))
+                return local.ToArray();
             lock (nxdnKeySync)
             {
                 if (nxdnLocalKeys.Contains((string.Empty, cipher, id)) &&
@@ -72,8 +76,7 @@ namespace dvmconsole
 
         private void ImportNxdnNetworkKeys(KeyResponseEvent e, string sourceSystemName)
         {
-            // Synthetic P25 key-file events are not NXDN entries. Only real FNE
-            // responses may bridge KMM algorithm IDs to NXDN wire cipher IDs.
+            // Downloaded keys are scoped to their source FNE.
             if (sourceSystemName == null)
                 return;
             byte cipher = NXDNCrypto.FromKeyRequestAlgorithm(e.KmmKey.KeysetItem.AlgId);
@@ -83,13 +86,8 @@ namespace dvmconsole
             {
                 if (sourceSystemName != null && !ResourceIdentity.SystemMatches(sourceSystemName, system.Name))
                     continue;
-                foreach (var key in e.KmmKey.KeysetItem.Keys.Where(key => key.KeyId is > 0 and <= 63))
+                foreach (var key in e.KmmKey.KeysetItem.Keys.Where(key => key != null && key.KeyId is > 0 and <= 63))
                 {
-                    if (!(Codeplug.Zones ?? []).SelectMany(zone => zone.Channels ?? []).Any(channel =>
-                        channel.GetChannelMode() == Codeplug.ChannelMode.NXDN &&
-                        ResourceIdentity.SystemMatches(channel.System, system.Name) &&
-                        channel.GetNxdnCipherType() == cipher && channel.GetKeyId() == key.KeyId))
-                        continue;
                     byte[] material = key.GetKey().ToArray();
                     try
                     {
@@ -263,7 +261,7 @@ namespace dvmconsole
         {
             foreach (ChannelBox channel in GetAllCanvases().SelectMany(canvas => canvas.Children.OfType<ChannelBox>()))
             {
-                Codeplug.Channel config = Codeplug?.GetChannelByName(channel.ChannelName);
+                Codeplug.Channel config = channel.ConfiguredChannel;
                 if (config?.GetChannelMode() != Codeplug.ChannelMode.NXDN)
                     continue;
                 Codeplug.System system = Codeplug.GetSystemForChannel(config);
@@ -285,11 +283,11 @@ namespace dvmconsole
             {
                 foreach (ChannelBox channel in selectedChannelsManager.GetSelectedChannels().ToList())
                 {
-                    Codeplug.Channel config = Codeplug.GetChannelByName(channel.ChannelName);
+                    Codeplug.Channel config = channel.ConfiguredChannel;
                     Codeplug.System system = config == null ? null : Codeplug.GetSystemForChannel(config);
                     if (system == null || config.GetChannelMode() != Codeplug.ChannelMode.NXDN ||
                         !ResourceIdentity.SystemMatches(system.Name, sourceSystemName) || config.Tgid != e.DstId.ToString() ||
-                        !channel.IsEnabled || channel.PttState || channel.TxStreamId != 0 ||
+                        !channel.IsEnabled || channel.IsOperatorTransmitting || channel.TxStreamId != 0 ||
                         patchManager.IsPatchedTransmitStream(system.Name, config.Tgid, e.StreamId))
                         continue;
                     bool duplicate = selectedChannelsManager.GetSelectedChannels().Any(other => other.InternalID != channel.InternalID &&
@@ -346,6 +344,7 @@ namespace dvmconsole
                             Log.WriteLine($"({system.Name}) NXDD: Traffic *CALL START     * SRC_ID {e.SrcId} TGID {e.DstId} [STREAM ID {e.StreamId}]");
                         }
                         channel.RxHistory?.UpdateSource(e.StreamId, (int)e.SrcId, alias);
+                        channel.RxHistory?.UpdateEncryption(e.StreamId, call.IsEncrypted, call.KeyId);
                         if (call.IsReleased)
                         {
                             EndTarRxRecordingFromChannelState(system, config, channel, status, packetTime);

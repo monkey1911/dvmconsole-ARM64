@@ -16,6 +16,7 @@
 */
 
 using fnecore.P25;
+using System.IO;
 using YamlDotNet.Serialization;
 
 namespace dvmconsole
@@ -41,9 +42,29 @@ namespace dvmconsole
         */
 
         /// <summary>
-        /// The location of the YAML keyfile
+        /// Loaded codeplug location used to resolve local file references.
+        /// </summary>
+        [YamlIgnore]
+        public string SourcePath { get; internal set; }
+
+        /// <summary>
+        /// The location of a password-protected KFDEKC container.
         /// </summary>
         public string KeyFile { get; set; } = null;
+        /// <summary>
+        /// Maximum operator PTT duration in seconds. Zero disables the timeout.
+        /// </summary>
+        public int TransmitTimeoutSeconds
+        {
+            get => transmitTimeoutSeconds;
+            set
+            {
+                if (value < 0)
+                    throw new ArgumentOutOfRangeException(nameof(TransmitTimeoutSeconds), "Transmit timeout must be zero or a positive number of seconds.");
+                transmitTimeoutSeconds = value;
+            }
+        }
+        private int transmitTimeoutSeconds = 180;
         /// <summary>
         /// List of systems.
         /// </summary>
@@ -132,7 +153,7 @@ namespace dvmconsole
             /// <summary>
             /// 
             /// </summary>
-            public string AliasPath { get; set; } = "./alias.yml";
+            public string AliasPath { get; set; } = "alias.yml";
             /// <summary>
             /// Automatically download RID aliases from the connected FNE.
             /// </summary>
@@ -485,47 +506,22 @@ namespace dvmconsole
         /// <returns></returns>
         public System GetSystemForChannel(Channel channel)
         {
-            return Systems.FirstOrDefault(s => s.Name == channel.System);
+            if (channel == null || string.IsNullOrWhiteSpace(channel.System))
+                return null;
+
+            return Systems?.FirstOrDefault(s => ResourceIdentity.SystemMatches(s.Name, channel.System));
         }
 
         /// <summary>
-        /// Helper to return a system by looking up a channel name
+        /// Resolve local files beside the codeplug, not the process working directory.
         /// </summary>
-        /// <param name="channelName"></param>
-        /// <returns></returns>
-        public System GetSystemForChannel(string channelName)
+        public string ResolveFilePath(string path)
         {
-            if (Zones == null)
+            if (string.IsNullOrWhiteSpace(path))
                 return null;
 
-            foreach (Zone zone in Zones)
-            {
-                Channel channel = zone.Channels.FirstOrDefault(c => c.Name == channelName);
-                if (channel != null)
-                    return Systems.FirstOrDefault(s => s.Name == channel.System);
-            }
-
-            return null;
+            return Path.GetFullPath(path, Path.GetDirectoryName(SourcePath));
         }
 
-        /// <summary>
-        /// Helper to return a <see cref="Channel"/> by channel name
-        /// </summary>
-        /// <param name="channelName"></param>
-        /// <returns></returns>
-        public Channel GetChannelByName(string channelName)
-        {
-            if (Zones == null)
-                return null;
-
-            foreach (Zone zone in Zones)
-            {
-                Channel channel = zone.Channels.FirstOrDefault(c => c.Name == channelName);
-                if (channel != null)
-                    return channel;
-            }
-
-            return null;
-        }
     } //public class Codeplug
 } // namespace dvmconsole

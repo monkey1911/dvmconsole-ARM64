@@ -166,7 +166,7 @@ namespace dvmconsole
         {
             foreach (ChannelBox channel in GetAllCanvases().SelectMany(canvas => canvas.Children.OfType<ChannelBox>()))
             {
-                Codeplug.Channel config = Codeplug?.GetChannelByName(channel.ChannelName);
+                Codeplug.Channel config = channel.ConfiguredChannel;
                 if (config?.GetChannelMode() != Codeplug.ChannelMode.DMR)
                     continue;
                 Codeplug.System system = Codeplug.GetSystemForChannel(config);
@@ -262,11 +262,11 @@ namespace dvmconsole
                 {
                 foreach (ChannelBox channel in selectedChannelsManager.GetSelectedChannels())
                 {
-                    if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
+                    if (channel.IsLocalPlayback)
                         continue;
 
-                    Codeplug.System system = Codeplug.GetSystemForChannel(channel.ChannelName);
-                    Codeplug.Channel cpgChannel = Codeplug.GetChannelByName(channel.ChannelName);
+                    Codeplug.System system = Codeplug.GetSystemForChannel(channel.ConfiguredChannel);
+                    Codeplug.Channel cpgChannel = channel.ConfiguredChannel;
 
                     if (system == null || cpgChannel == null)
                     {
@@ -283,7 +283,7 @@ namespace dvmconsole
 
                     PeerSystem handler = fneSystemManager.GetFneSystem(system.Name);
 
-                    if (!channel.IsEnabled || channel.Name == PLAYBACKCHNAME)
+                    if (!channel.IsEnabled)
                         continue;
 
                     if (cpgChannel.Tgid != e.DstId.ToString())
@@ -296,7 +296,7 @@ namespace dvmconsole
                     if (patchManager.IsPatchedTransmitStream(system.Name, cpgChannel.Tgid, e.StreamId))
                         continue;
 
-                    if (channel.PttState)
+                    if (channel.IsOperatorTransmitting)
                         continue;
 
                     string statusKey = ResourceIdentity.Build(system.Name, cpgChannel.Tgid) + $"|slot:{e.Slot}";
@@ -406,6 +406,7 @@ namespace dvmconsole
                     }
 
                     channel.RxHistory?.UpdateSource(e.StreamId, (int)e.SrcId, alias);
+                    channel.RxHistory?.UpdateEncryption(e.StreamId, dmrCall.IsEncrypted, dmrCall.KeyId);
                     if (channel.IsReceiving && channel.RxStreamId == e.StreamId && !isConsoleRid)
                         channel.LastSrcId = string.IsNullOrEmpty(alias) ? "Last ID: " + e.SrcId : "Last: " + alias;
 
