@@ -96,7 +96,9 @@ namespace dvmconsole
             public List<ChannelIdentity> Members { get; set; } = new List<ChannelIdentity>();
             public bool IsEditing { get; set; }
             public bool IsPttActive { get; set; }
+            public bool IsPttTimedOut { get; set; }
             public bool IsAlertToneTargetActive { get; set; }
+            public bool IsAlertToneTransmitting { get; set; }
             public bool IsOneWay { get; set; }
             public bool IsPatchEnabled { get; set; }
         }
@@ -519,16 +521,25 @@ namespace dvmconsole
                 RebuildTalkgroupList(context);
         }
 
-        public void ClearAlertToneTargetStates()
+        public void SetAlertToneTransmitting(string groupName, bool transmitting)
         {
-            foreach (PatchTabContext context in tabContexts.Values)
-            {
-                if (!context.IsAlertToneTargetActive)
-                    continue;
+            if (!tabContexts.TryGetValue(groupName, out PatchTabContext context))
+                return;
 
-                context.IsAlertToneTargetActive = false;
-                UpdateContextVisualState(context);
-            }
+            context.IsAlertToneTransmitting = transmitting;
+            context.IsAlertToneTargetActive = transmitting;
+            UpdateContextVisualState(context);
+        }
+
+        /// <summary>
+        /// Displays an expired PTT while retaining the toggle until the operator releases it.
+        /// </summary>
+        public void SetPttTimedOut(string groupName, bool timedOut)
+        {
+            if (!tabContexts.TryGetValue(groupName, out PatchTabContext context))
+                return;
+            context.IsPttTimedOut = timedOut;
+            UpdateContextVisualState(context);
         }
 
         /// <summary>
@@ -557,7 +568,9 @@ namespace dvmconsole
             bool wasPttActive = context.IsPttActive;
             bool wasAlertToneTargetActive = context.IsAlertToneTargetActive;
             context.IsPttActive = false;
+            context.IsPttTimedOut = false;
             context.IsAlertToneTargetActive = false;
+            context.IsAlertToneTransmitting = false;
             if (context.PttButton != null)
                 context.PttButton.Tag = context;
             UpdateContextVisualState(context);
@@ -599,6 +612,7 @@ namespace dvmconsole
             }
 
             context.IsPttActive = !context.IsPttActive;
+            context.IsPttTimedOut = false;
             UpdateContextVisualState(context);
             RaisePatchPttStateChanged(context, context.IsPttActive);
         }
@@ -611,6 +625,7 @@ namespace dvmconsole
                 return;
 
             context.IsAlertToneTargetActive = !context.IsAlertToneTargetActive;
+            context.IsAlertToneTransmitting = false;
             UpdateContextVisualState(context);
             RaiseAlertToneTargetStateChanged(context, context.IsAlertToneTargetActive);
         }
@@ -679,6 +694,7 @@ namespace dvmconsole
             if (!context.IsPatchEnabled && context.IsAlertToneTargetActive)
             {
                 context.IsAlertToneTargetActive = false;
+                context.IsAlertToneTransmitting = false;
                 RaiseAlertToneTargetStateChanged(context, false);
             }
 
@@ -1117,16 +1133,17 @@ namespace dvmconsole
             if (context.EditIcon != null)
                 context.EditIcon.Source = context.IsEditing ? GetEditActiveIcon(context) : GetEditInactiveIcon(context);
             if (context.PttIcon != null)
-                context.PttIcon.Source = context.IsPttActive ? GetPttActiveIcon(context) : GetPttInactiveIcon(context);
+                context.PttIcon.Source = context.IsPttActive && !context.IsPttTimedOut ? GetPttActiveIcon(context) : GetPttInactiveIcon(context);
 
             if (context.EditText != null)
                 context.EditText.Text = context.IsEditing ? "Stop Editing" : "Edit Members";
             if (context.PttText != null)
-                context.PttText.Text = context.IsPttActive
+                context.PttText.Text = context.IsPttTimedOut ? "PTT Timed Out - Release" : context.IsPttActive
                     ? (isMultiSelect ? "Stop Multi-Select PTT" : "Stop Patch PTT")
                     : (isMultiSelect ? "Multi-Select PTT" : "Patch PTT");
             if (context.AlertToneText != null)
-                context.AlertToneText.Text = context.IsAlertToneTargetActive ? "Alert Armed" : "Alert Tone";
+                context.AlertToneText.Text = context.IsAlertToneTransmitting ? "Stop Tone" :
+                    context.IsAlertToneTargetActive ? "Alert Armed" : "Alert Tone";
 
             if (context.EditButton != null)
             {
@@ -1139,12 +1156,12 @@ namespace dvmconsole
 
             if (context.PttButton != null)
             {
-                context.PttButton.Background = context.IsPttActive ? GetAccentBrush(context) : ButtonIdleBackground;
+                context.PttButton.Background = context.IsPttActive && !context.IsPttTimedOut ? GetAccentBrush(context) : ButtonIdleBackground;
                 context.PttButton.Foreground = InfoTextBrush;
                 bool pttAvailable = patchAvailable && (!IsAnyGroupEditing || context.IsPttActive);
                 context.PttButton.IsEnabled = pttAvailable;
                 context.PttButton.Opacity = pttAvailable ? 1.0 : 0.55;
-                context.PttButton.ToolTip = !patchAvailable
+                context.PttButton.ToolTip = context.IsPttTimedOut ? "Transmit timed out. Click to release PTT before rekeying." : !patchAvailable
                     ? $"Enable {context.GroupName} before using Patch PTT."
                     : IsAnyGroupEditing && !context.IsPttActive
                         ? "PTT is disabled while patch editing is active. Click Stop Editing before transmitting."
@@ -1162,6 +1179,8 @@ namespace dvmconsole
                 context.AlertToneButton.Opacity = patchAvailable ? 1.0 : 0.55;
                 context.AlertToneButton.ToolTip = !patchAvailable
                     ? $"Enable {context.GroupName} before arming it for alert tones."
+                    : context.IsAlertToneTransmitting
+                        ? $"Sending tones to {context.GroupName}. Click again to cancel."
                     : context.IsAlertToneTargetActive
                         ? $"All members in {context.GroupName} are armed for the next alert tone. Click again to clear."
                         : $"Arm every member in {context.GroupName} for the next alert tone.";

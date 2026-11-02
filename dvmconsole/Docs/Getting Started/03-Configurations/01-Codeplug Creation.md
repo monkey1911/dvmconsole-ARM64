@@ -12,6 +12,7 @@ Common optional sections include:
 - `groups`
 - `keyFile`
 - `patchSourceIdPassthrough`
+- `transmitTimeoutSeconds`
 - `web_streams` under a zone
 
 ---
@@ -27,7 +28,7 @@ There have been major changes to resource configuration. Do not assume an older 
 # Basic Structure
 
 ```yaml
-keyFile: "Full/Path/To/Keyfile.clear"
+keyFile: 'Keys.ekc'
 
 systems:
   - ...
@@ -43,7 +44,15 @@ zones:
 
 ---
 
+# Transmit Timeout
+
+The top-level `transmitTimeoutSeconds` setting limits each operator transmission, including individual, global, patch-group, and MSEL PTT. It defaults to `180` seconds when omitted; set it to `0` to disable it. Negative values are rejected. There is no UI override. Generated tones, channel markers, and automatic patch forwarding are not timed out.
+
+During the final 10 seconds, Console plays a short local beep each second. At timeout it ends the call and plays a single local tone. Release PTT (or toggle it off) before starting another call. These alerts use the Console master audio output and are not added to transmitted audio.
+
 # Systems
+
+Local file paths (`keyFile` and `aliasPath`) can be filenames or relative paths, resolved from the codeplug's directory, not Console's working directory. For example, `'Keys.ekc'` uses a file beside the codeplug, and `'Aliases\alias.yml'` uses a subfolder. Absolute paths still work. Use single quotes around Windows paths such as `'C:\Radio\alias.yml'`; double-quoted YAML treats backslashes as escapes. Existing forward-slash paths remain supported.
 
 Systems define FNE connections.
 
@@ -60,7 +69,8 @@ systems:
     password: "RPT_PASSWORD"
     encrypted: false
     presharedKey: "123ABC1234"
-    aliasPath: "Full/Path/To/alias.yml"
+    aliasPath: 'alias.yml'
+    syncRadioAliases: false # Enable only when the FNE supports radio alias sync.
 ```
 
 Fields:
@@ -76,7 +86,7 @@ Fields:
 - `encrypted`: whether the FNE connection uses transport encryption.
 - `presharedKey`: key used when `encrypted` is enabled.
 - `kmfPresharedKey`: optional 64-hex-character AES-256 key for FNE-wrapped key responses. Required when the FNE enables `kmfEncKeyRequest`; separate from the transport key.
-- `aliasPath`: optional RID alias YAML file.
+- `aliasPath`: optional RID alias YAML file; defaults to `alias.yml` beside the codeplug.
 - `syncRadioAliases`: optional, defaults to `false`. Download and cache this system's RID aliases from a supporting FNE after connecting. See **RID Aliases** for requirements and local-file fallback.
 
 ---
@@ -120,7 +130,7 @@ channels:
     system: "System 1"
     tgid: "2001"
     mode: "p25"
-    keyId: 0x50
+    keyId: "50"
     algo: "aes"
     selectable_encryption: true
     resourceColor: "#150282"
@@ -134,7 +144,7 @@ Fields:
 - `system`: system name from the `systems` section.
 - `tgid`: target talkgroup ID.
 - `mode`: `p25`, `dmr`, `nxdn`, or `analog`. If omitted, P25 is used.
-- `keyId`: optional encryption key ID.
+- `keyId`: optional encryption key ID, written as a hexadecimal string (for example, `"50"` means `0x50`).
 - `algo`: optional encryption algorithm, such as `aes`, `des`, `arc4`, or `none`.
 - `scrambler_code`: optional analog voice-inversion code (`0` for off, or `2` through `16`); see [Analog](08-Analog.md). This is not an FNE encryption key.
 - `selectable_encryption`: optional flag for P25, NXDN, or analog resources with `scrambler_code`. When `true`, the card shows a **SELECT** toggle so operators can choose protected or clear transmit. Digital modes require a valid `keyId` and `algo`; analog inversion uses its codeplug frequency and no key. Encrypted DMR is temporarily unavailable.
@@ -234,20 +244,20 @@ When `true`, the console attempts to pass through the inbound source ID while fo
 
 # Key File
 
-Use `keyFile` to reference a YAML key file:
+Use `keyFile` to reference a KFDEKC encrypted container:
 
 ```yaml
-keyFile: "Full/Path/To/Keyfile.clear"
+keyFile: 'Keys.ekc'
 ```
 
-See **Encryption Keys** for the key file format and runtime behavior.
+Relative paths resolve beside the codeplug. Console prompts for the password and remembers it using Windows account encryption. Do not put the password in the codeplug. Clear key files are no longer supported. See **Encryption Keys** for setup and runtime behavior.
 
 ---
 
 # Example Codeplug
 
 ```yaml
-keyFile: "C:/Example/keys.clear"
+keyFile: 'C:\Example\Keys.ekc'
 
 systems:
   - name: "System 1"
@@ -259,7 +269,8 @@ systems:
     password: "RPT_PASSWORD"
     encrypted: false
     presharedKey: "123ABC1234"
-    aliasPath: "C:/Example/alias.yml"
+    aliasPath: 'C:\Example\alias.yml'
+    syncRadioAliases: false # Enable only when the FNE supports radio alias sync.
 
 groups:
   - name: "Patch 1"
@@ -278,7 +289,7 @@ zones:
         system: "System 1"
         tgid: "2001"
         mode: "p25"
-        keyId: 0x50
+        keyId: "50"
         algo: "aes"
         resourceColor: "#150282"
         card_size: normal
@@ -305,6 +316,8 @@ zones:
         system: "System 1"
         tgid: "3001"
         mode: "dmr"
+        slot: 1
+        algo: "none"
 ```
 
 ---
@@ -312,7 +325,7 @@ zones:
 # Recommended Practices
 
 - Keep system names stable after deployment because channels reference them.
-- Use clear channel names because saved positions and volume are keyed by channel name.
+- Use clear channel names as display labels. Routing uses each card's codeplug entry; saved channel positions, volume, and selection use system/TG identity. Matching channel names or TGIDs on different systems are supported.
 - Use clear group names, such as `Patch 1` or `Multi Select 1`.
 - Keep zone tabs short enough for operators to scan quickly.
 - Verify each channel references a valid system.

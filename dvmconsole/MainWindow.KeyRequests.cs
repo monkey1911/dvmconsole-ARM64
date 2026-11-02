@@ -12,17 +12,11 @@
 */
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows;
 
 using fnecore;
-using fnecore.P25.KMM;
-
-using YamlDotNet.Serialization;
-using YamlDotNet.Serialization.NamingConventions;
 
 namespace dvmconsole
 {
@@ -40,7 +34,7 @@ namespace dvmconsole
         {
             foreach (var channel in selectedChannelsManager.GetSelectedChannels())
             {
-                Codeplug.Channel config = Codeplug?.GetChannelByName(channel.ChannelName);
+                Codeplug.Channel config = channel.ConfiguredChannel;
                 if (config == null || !ResourceIdentity.SystemMatches(config.System, systemName) ||
                     !config.HasEncryptionConfig() || channel.HasLoadedTransmitKey())
                     continue;
@@ -79,11 +73,8 @@ namespace dvmconsole
                 if (!deferredStartupKeyRequestsBySystem.TryGetValue(systemName, out HashSet<string> requests) || requests.Count == 0)
                     return;
 
-                if (deferredStartupKeyRequestTimers.TryGetValue(systemName, out CancellationTokenSource existing))
-                {
-                    existing.Cancel();
-                    deferredStartupKeyRequestTimers.Remove(systemName);
-                }
+                if (deferredStartupKeyRequestTimers.ContainsKey(systemName))
+                    return;
 
                 cts = new CancellationTokenSource();
                 deferredStartupKeyRequestTimers[systemName] = cts;
@@ -106,6 +97,8 @@ namespace dvmconsole
                 List<(byte AlgId, ushort KeyId)> requestsToSend = new();
                 lock (deferredKeyRequestSync)
                 {
+                    if (!deferredStartupKeyRequestTimers.TryGetValue(systemName, out var timer) || timer != cts)
+                        return;
                     if (!deferredStartupKeyRequestsBySystem.TryGetValue(systemName, out HashSet<string> pending) || pending.Count == 0)
                         return;
 
@@ -116,7 +109,6 @@ namespace dvmconsole
                     }
 
                     deferredStartupKeyRequestsBySystem.Remove(systemName);
-                    deferredStartupKeyRequestTimers.Remove(systemName);
                 }
 
                 foreach ((byte algId, ushort keyId) in requestsToSend)
@@ -145,13 +137,16 @@ namespace dvmconsole
                 }
 
                 cts.Dispose();
+                ScheduleDeferredStartupKeyRequests(systemName);
             }
         }
 
         private void CancelDeferredStartupKeyRequests(string systemName)
         {
+            networkKeys.ClearRequests(systemName);
             lock (deferredKeyRequestSync)
             {
+                deferredStartupKeyRequestsBySystem.Remove(systemName);
                 if (deferredStartupKeyRequestTimers.TryGetValue(systemName, out CancellationTokenSource existing))
                 {
                     existing.Cancel();
@@ -190,7 +185,11 @@ namespace dvmconsole
 
         private bool TrySendMasterKeyRequest(PeerSystem fne, string systemName, byte algId, ushort keyId)
         {
-            if (fne?.peer == null || string.IsNullOrWhiteSpace(systemName))
+            if (fne?.peer == null || string.IsNullOrWhiteSpace(systemName) || algId is 0 or 0x80 || keyId == 0 ||
+                GetFneConnectionEntry(systemName)?.IsConnected != true)
+                return false;
+
+            if (localKeys?.TryGetKey(algId, keyId, out _) == true)
                 return false;
 
             Codeplug.System system = Codeplug?.Systems?.FirstOrDefault(s =>
@@ -204,68 +203,21 @@ namespace dvmconsole
                 return false;
             }
 
-            fne.peer.SendMasterKeyRequest(algId, keyId, consoleRid);
+            if (!networkKeys.TryBeginRequest(systemName, algId, keyId, Environment.TickCount64))
+                return false;
+            try
+            {
+                fne.peer.SendMasterKeyRequest(algId, keyId, consoleRid);
+            }
+            catch (Exception ex)
+            {
+                networkKeys.ForgetRequest(systemName, algId, keyId);
+                Log.WriteWarning($"({system.Name}) Key request ALGID {algId} KID {keyId} failed: {ex.Message}");
+                return false;
+            }
             Log.WriteLine($"({system.Name}) Sent key request RID {consoleRid} ALGID {algId} KID {keyId}");
             return true;
         }
 
-        private void LoadConfiguredKeyFileKeys()
-        {
-            if (Codeplug?.KeyFile == null)
-                return;
-
-            if (!File.Exists(Codeplug.KeyFile))
-            {
-                MessageBox.Show($"Key file {Codeplug.KeyFile} not found. {PLEASE_CHECK_CODEPLUG}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                return;
-            }
-
-            var deserializer = new DeserializerBuilder()
-                .WithNamingConvention(CamelCaseNamingConvention.Instance)
-                .IgnoreUnmatchedProperties()
-                .Build();
-            var keys = deserializer.Deserialize<KeyContainer>(File.ReadAllText(Codeplug.KeyFile));
-            var keysetItems = new Dictionary<int, KeysetItem>();
-
-            foreach (var keyEntry in keys.Keys)
-            {
-                if (string.Equals(keyEntry.Protocol, "dmr", StringComparison.OrdinalIgnoreCase))
-                {
-                    Log.WriteWarning("Skipping local DMR key: encrypted DMR is unavailable in this build.");
-                    continue;
-                }
-                if (string.Equals(keyEntry.Protocol, "nxdn", StringComparison.OrdinalIgnoreCase))
-                {
-                    try { SetNxdnKey(keyEntry.System, checked((byte)keyEntry.AlgId), keyEntry.KeyId, keyEntry.KeyBytes, local: true); }
-                    catch (Exception ex) { Log.WriteWarning($"Invalid local NXDN key {keyEntry.KeyId}: {ex.Message}"); }
-                    continue;
-                }
-                var keyItem = new KeyItem
-                {
-                    KeyId = keyEntry.KeyId
-                };
-                var keyBytes = keyEntry.KeyBytes;
-                keyItem.SetKey(keyBytes, (uint)keyBytes.Length);
-                if (!keysetItems.ContainsKey(keyEntry.AlgId))
-                {
-                    var asByte = (byte)keyEntry.AlgId;
-                    keysetItems.Add(keyEntry.AlgId, new KeysetItem() { AlgId = asByte });
-                }
-
-                keysetItems[keyEntry.AlgId].AddKey(keyItem);
-            }
-
-            foreach (var eventData in keysetItems.Select(keyValuePair => keyValuePair.Value).Select(keysetItem => new KeyResponseEvent(0, new KmmModifyKey
-                     {
-                         AlgId = 0,
-                         KeyId = 0,
-                         MessageId = 0,
-                         MessageLength = 0,
-                         KeysetItem = keysetItem
-                     }, [])))
-            {
-                KeyResponseReceived(eventData);
-            }
-        }
     }
 }

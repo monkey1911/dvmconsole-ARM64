@@ -130,7 +130,6 @@ namespace dvmconsole
         private bool isShuttingDown = false;
         private bool suppressSelectedResourcePersistence = false;
         private bool globalPttState = false;
-        private bool keyboardPttShortcutDown = false;
 
         private const int GridSize = 5;
 
@@ -198,6 +197,7 @@ namespace dvmconsole
         private Dictionary<string, bool> patchGroupEnabledStates = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, List<SettingsManager.PatchTalkgroupMember>> currentPatchMemberships = new Dictionary<string, List<SettingsManager.PatchTalkgroupMember>>();
         private readonly Dictionary<string, List<SettingsManager.PatchTalkgroupMember>> activeAlertToneGroupTargets = new Dictionary<string, List<SettingsManager.PatchTalkgroupMember>>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, ToneTransmitGroupSession> activeToneTransmitGroups = new Dictionary<string, ToneTransmitGroupSession>(StringComparer.OrdinalIgnoreCase);
         private readonly object toneTransmitSync = new object();
         private readonly Dictionary<string, CancellationTokenSource> activeToneTransmitCancels = new Dictionary<string, CancellationTokenSource>(StringComparer.OrdinalIgnoreCase);
         private System.Windows.Threading.DispatcherTimer alertToneScheduleTimer;
@@ -212,7 +212,6 @@ namespace dvmconsole
 
         private CancellationTokenSource maintainenceCancelToken = new CancellationTokenSource();
         private Task maintainenceTask = null;
-        private CancellationTokenSource keyboardPttWatchdogCancelToken = null;
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
@@ -237,6 +236,7 @@ namespace dvmconsole
             public Codeplug.System CodeplugSystem { get; set; }
             public PeerSystem Fne { get; set; }
             public uint SourceId { get; set; }
+            public uint StreamId { get; set; }
         }
 
         private sealed class ToneTransmitTarget
@@ -245,6 +245,14 @@ namespace dvmconsole
             public Codeplug.Channel CodeplugChannel { get; set; }
             public Codeplug.System CodeplugSystem { get; set; }
             public PeerSystem Fne { get; set; }
+        }
+
+        private sealed class ToneTransmitGroupSession
+        {
+            public string GroupName { get; set; }
+            public List<SettingsManager.PatchTalkgroupMember> Members { get; set; }
+            public HashSet<ChannelBox> Targets { get; set; }
+            public HashSet<CancellationTokenSource> Cancels { get; } = new HashSet<CancellationTokenSource>();
         }
 
         private sealed class GeneratedTonePayload
@@ -1080,10 +1088,13 @@ namespace dvmconsole
         /// <param name="filePath"></param>
         private void LoadCodeplug(string filePath)
         {
+            ReleaseAllOperatorPttInputs();
+            StopOperatorPttTimers();
             StopDmrChannels();
             StopNxdnChannels();
             StopAnalogChannels();
             ClearNxdnKeys();
+            ClearLocalKeys();
             DisableControls();
             StopAllPatchPttTargets();
 
@@ -1105,8 +1116,11 @@ namespace dvmconsole
                     .IgnoreUnmatchedProperties()
                     .Build();
 
+                filePath = Path.GetFullPath(filePath);
                 string yaml = File.ReadAllText(filePath);
                 Codeplug = deserializer.Deserialize<Codeplug>(yaml);
+                if (Codeplug != null)
+                    Codeplug.SourcePath = filePath;
                 Codeplug?.NormalizeGroups();
 
                 // perform codeplug validation
@@ -1195,6 +1209,8 @@ namespace dvmconsole
                     MessageBox.Show(messageBoxString, "Error", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
 
+                LoadConfiguredEkcKeys();
+
                 // generate widgets and enable controls
                 GenerateChannelWidgets();
                 UpdatePatchMemberIndicators(FilterPatchMemberships(memberships), patchGroupEnabledStates);
@@ -1208,6 +1224,8 @@ namespace dvmconsole
             catch (Exception ex)
             {
                 Codeplug = null;
+                ClearLocalKeys();
+                ClearNxdnKeys();
                 patchGroupsWindow.SetPatchGroups(null, null);
                 patchGroupModes = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
                 patchGroupEnabledStates = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
@@ -1229,6 +1247,8 @@ namespace dvmconsole
         /// </summary>
         private void GenerateChannelWidgets()
         {
+            ReleaseAllOperatorPttInputs();
+            StopOperatorPttTimers();
             StopDmrChannels();
             StopNxdnChannels();
             StopAnalogChannels();
@@ -1387,10 +1407,11 @@ namespace dvmconsole
                             ? tabCanvases[targetTab] 
                             : channelsCanvas;
 
-                        ChannelBox channelBox = new ChannelBox(selectedChannelsManager, audioManager, channel.Name, channel.System, channel.Tgid, settingsManager.TogglePTTMode);
+                        ChannelBox channelBox = new ChannelBox(selectedChannelsManager, audioManager, channel, settingsManager.TogglePTTMode);
                         channelBox.CardSize = ChannelBox.ParseCardSize(channel.CardSize);
                         channelBox.ChannelMode = channel.Mode.ToUpperInvariant();
                         channelBox.IsRxOnly = channel.RxOnly;
+                        ApplyP25TransmitKey(channelBox, channel);
                         channelBox.CanStartPtt = CanStartChannelPtt;
                         channelBox.HasTransmitKey = () => channel.GetChannelMode() switch
                         {
@@ -1441,8 +1462,6 @@ namespace dvmconsole
                         }
 
                         channelBox.PTTButtonClicked += ChannelBox_PTTButtonClicked;
-                        channelBox.PTTButtonPressed += ChannelBox_PTTButtonPressed;
-                        channelBox.PTTButtonReleased += ChannelBox_PTTButtonReleased;
                         channelBox.PageButtonClicked += ChannelBox_PageButtonClicked;
                         channelBox.HoldChannelButtonClicked += ChannelBox_HoldChannelButtonClicked;
                         channelBox.SelectableEncryptionClicked += ChannelBox_SelectableEncryptionClicked;
@@ -1581,7 +1600,7 @@ namespace dvmconsole
                 ? tabCanvases[defaultTab] 
                 : channelsCanvas;
                 
-            playbackChannelBox = new ChannelBox(selectedChannelsManager, audioManager, PLAYBACKCHNAME, PLAYBACKSYS, PLAYBACKTG);
+            playbackChannelBox = new ChannelBox(selectedChannelsManager, audioManager);
             playbackChannelBox.ChannelMode = "Local";
             playbackChannelBox.HidePTTButton(); // playback box shouldn't have PTT
 
@@ -1614,6 +1633,7 @@ namespace dvmconsole
             RefreshAllChannelConnectionVisuals();
 
             RestoreSelectedChannels();
+            InitializeKeyboardShortcuts();
             RestoreSelectedWebStreams();
             RestoreRuntimeSelectedResourceSnapshot(activeChannelKeys, activeWebStreamNames, hiddenZoneNames);
             Cursor = Cursors.Arrow;
@@ -1722,9 +1742,7 @@ namespace dvmconsole
         private List<string> CaptureActiveSelectedChannelKeys()
         {
             return GetSelectedChannelsForPersistence()
-                .Where(channel => channel.SystemName != PLAYBACKSYS &&
-                                  channel.ChannelName != PLAYBACKCHNAME &&
-                                  channel.DstId != PLAYBACKTG)
+                .Where(channel => !channel.IsLocalPlayback)
                 .Select(BuildChannelSelectionKey)
                 .Where(key => !string.IsNullOrWhiteSpace(key))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -1953,13 +1971,12 @@ namespace dvmconsole
         /// </summary>
         private void SelectedChannelsChanged()
         {
-            bool loadedConfiguredKeys = false;
             foreach (ChannelBox channel in selectedChannelsManager.GetSelectedChannels().ToList())
             {
-                if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
+                if (channel.IsLocalPlayback)
                     continue;
 
-                Codeplug.System system = Codeplug.GetSystemForChannel(channel.ChannelName);
+                Codeplug.System system = Codeplug.GetSystemForChannel(channel.ConfiguredChannel);
                 if (system == null)
                 {
                     MessageBox.Show($"{channel.ChannelName} refers to an {INVALID_SYSTEM} {channel.SystemName}. {PLEASE_CHECK_CODEPLUG}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
@@ -1968,7 +1985,7 @@ namespace dvmconsole
                     continue;
                 }
 
-                Codeplug.Channel cpgChannel = Codeplug.GetChannelByName(channel.ChannelName);
+                Codeplug.Channel cpgChannel = channel.ConfiguredChannel;
                 if (cpgChannel == null)
                 {
                     // bryanb: this should actually never happen...
@@ -2001,11 +2018,8 @@ namespace dvmconsole
                       // if the channel is configured for encryption request the key from the FNE
                       if (cpgChannel.HasEncryptionConfig() && cpgChannel.GetKeyId() != 0)
                       {
-                          if (!loadedConfiguredKeys)
-                          {
-                              LoadConfiguredKeyFileKeys();
-                              loadedConfiguredKeys = true;
-                          }
+                          if (ApplyP25TransmitKey(channel, cpgChannel))
+                              continue;
 
                           // DMR and NXDN use protocol-specific keyrings but share the FNE key service.
                           if (cpgChannel.GetChannelMode() == Codeplug.ChannelMode.NXDN &&
@@ -2050,7 +2064,7 @@ namespace dvmconsole
                 {
                     foreach (ChannelBox channel in canvas.Children.OfType<ChannelBox>())
                     {
-                        if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
+                        if (channel.IsLocalPlayback)
                             continue;
 
                         string resourceKey = BuildChannelSelectionKey(channel);
@@ -2078,6 +2092,7 @@ namespace dvmconsole
         /// <param name="e"></param>
         private void ResetChannel(ChannelBox e)
         {
+            StopOperatorPtt(e);
             lock (e.AnalogSync)
             {
                 EndAnalogTransmission(e);
@@ -2552,6 +2567,7 @@ namespace dvmconsole
         /// </summary>
         private void ClearReceiveState(ChannelBox channel, SlotStatus slotStatus = null)
         {
+            channel.ReceiveCrypto.Reset();
             channel.DmrRx?.Dispose();
             channel.DmrRx = null;
             channel.NxdnRx?.Dispose();
@@ -2582,11 +2598,13 @@ namespace dvmconsole
         {
             if (channel == null)
                 return;
+            channel.ReleaseAllPttInputs();
 
-            Codeplug.Channel cpgChannel = Codeplug?.GetChannelByName(channel.ChannelName);
-            Codeplug.System system = cpgChannel == null ? null : Codeplug?.GetSystemForChannel(channel.ChannelName);
+            Codeplug.Channel cpgChannel = channel.ConfiguredChannel;
+            Codeplug.System system = cpgChannel == null ? null : Codeplug?.GetSystemForChannel(channel.ConfiguredChannel);
             SlotStatus slotStatus = FindActiveReceiveStatus(channel, cpgChannel);
 
+            StopGroupTransmissionsForChannel(channel);
             StopTonePlaybackForChannel(channel, sendFallbackEndSignal: channel.PageState || channel.HoldState);
             EndTarRxRecordingFromChannelState(system, cpgChannel, channel, slotStatus, DateTime.Now);
             ClearReceiveState(channel, slotStatus);
@@ -2601,9 +2619,7 @@ namespace dvmconsole
             if (channel == null)
                 return;
 
-            bool isPlaybackChannel = channel.SystemName == PLAYBACKSYS ||
-                channel.ChannelName == PLAYBACKCHNAME ||
-                channel.DstId == PLAYBACKTG;
+            bool isPlaybackChannel = channel.IsLocalPlayback;
             if (isPlaybackChannel)
                 return;
 
@@ -2807,7 +2823,8 @@ namespace dvmconsole
                     $"ALRT {alertNumber}",
                     clearPageStateAfterSend: true,
                     sendStartSignal: true,
-                    $"Alert Tone {alertNumber}");
+                    $"Alert Tone {alertNumber}",
+                    includeArmedGroups: true);
             }
             catch (Exception ex)
             {
@@ -2870,7 +2887,8 @@ namespace dvmconsole
                     "ALRT TONE",
                     clearPageStateAfterSend: !forHold,
                     sendStartSignal: !forHold,
-                    "Alert Tone");
+                    "Alert Tone",
+                    includeArmedGroups: !forHold && targetChannel == null);
                 return true;
             }
             catch (Exception ex)
@@ -2941,14 +2959,10 @@ namespace dvmconsole
             {
                 if (sourceChannel == null)
                     continue;
-                if (sourceChannel.SystemName == PLAYBACKSYS || sourceChannel.ChannelName == PLAYBACKCHNAME || sourceChannel.DstId == PLAYBACKTG)
+                if (sourceChannel.IsLocalPlayback)
                     continue;
 
                 AddAlertToneTarget(targets, sourceChannel);
-
-                string sourceKey = BuildPatchTargetKey(NormalizeChannelSystemName(sourceChannel.SystemName), sourceChannel.DstId);
-                AddAlertTonePatchTargets(targets, sourceKey);
-                AddAlertToneMultiSelectTargets(targets, sourceKey);
             }
 
             return targets.Values.ToList();
@@ -2984,63 +2998,20 @@ namespace dvmconsole
                     .Equals(memberKey, StringComparison.OrdinalIgnoreCase));
         }
 
-        private void AddAlertTonePatchTargets(Dictionary<string, ChannelBox> targets, string sourceKey)
-        {
-            Dictionary<string, List<SettingsManager.PatchTalkgroupMember>> activePatchMemberships =
-                FilterPatchMemberships(currentPatchMemberships, patchGroupEnabledStates);
-
-            foreach (KeyValuePair<string, List<SettingsManager.PatchTalkgroupMember>> kvp in activePatchMemberships)
-            {
-                List<SettingsManager.PatchTalkgroupMember> members = kvp.Value ?? new List<SettingsManager.PatchTalkgroupMember>();
-                if (!members.Any(m => BuildPatchTargetKey(m.SystemName, m.Tgid).Equals(sourceKey, StringComparison.OrdinalIgnoreCase)))
-                    continue;
-
-                bool oneWay = patchGroupModes.TryGetValue(kvp.Key, out bool isOneWay) && isOneWay;
-                if (oneWay && !BuildPatchTargetKey(members.FirstOrDefault()?.SystemName, members.FirstOrDefault()?.Tgid).Equals(sourceKey, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                AddAlertToneMemberTargets(targets, members);
-            }
-        }
-
-        private void AddAlertToneMultiSelectTargets(Dictionary<string, ChannelBox> targets, string sourceKey)
-        {
-            Dictionary<string, List<SettingsManager.PatchTalkgroupMember>> multiSelectMemberships =
-                FilterMultiSelectMemberships(currentPatchMemberships);
-
-            foreach (KeyValuePair<string, List<SettingsManager.PatchTalkgroupMember>> kvp in multiSelectMemberships)
-            {
-                List<SettingsManager.PatchTalkgroupMember> members = kvp.Value ?? new List<SettingsManager.PatchTalkgroupMember>();
-                if (!members.Any(m => BuildPatchTargetKey(m.SystemName, m.Tgid).Equals(sourceKey, StringComparison.OrdinalIgnoreCase)))
-                    continue;
-
-                AddAlertToneMemberTargets(targets, members);
-            }
-        }
-
-        private void AddAlertToneMemberTargets(Dictionary<string, ChannelBox> targets, IEnumerable<SettingsManager.PatchTalkgroupMember> members)
-        {
-            foreach (SettingsManager.PatchTalkgroupMember member in members ?? Enumerable.Empty<SettingsManager.PatchTalkgroupMember>())
-            {
-                if (string.IsNullOrWhiteSpace(member?.SystemName) || string.IsNullOrWhiteSpace(member?.Tgid))
-                    continue;
-                if (!TryResolvePatchEndpoint(member.SystemName, member.Tgid, out ChannelBox channelBox, out _, out _, out _))
-                    continue;
-
-                AddAlertToneTarget(targets, channelBox);
-            }
-        }
-
         private void AddAlertToneTarget(Dictionary<string, ChannelBox> targets, ChannelBox channel)
         {
-            if (channel == null)
-                return;
-            if (channel.IsRxOnly)
+            if (!IsGroupTransmitAllowed(channel))
                 return;
 
-            string key = BuildPatchTargetKey(NormalizeChannelSystemName(channel.SystemName), channel.DstId);
+            string key = BuildPatchTargetKey(channel.ResourceSystemName, channel.DstId);
             if (!targets.ContainsKey(key))
                 targets[key] = channel;
+        }
+
+        private static bool IsGroupTransmitAllowed(ChannelBox channel)
+        {
+            return channel != null && channel.IsSelected && !channel.IsLocalPlayback &&
+                !channel.IsRxOnly && channel.ConfiguredChannel?.RxOnly != true;
         }
 
         private async Task SendToneStackAsync(
@@ -3064,7 +3035,8 @@ namespace dvmconsole
                 logLabel,
                 clearPageStateAfterSend,
                 sendStartSignal,
-                "Tone Presets");
+                "Tone Presets",
+                includeArmedGroups: clearPageStateAfterSend);
         }
 
         private async Task SendGeneratedTonePcmAsync(
@@ -3073,7 +3045,8 @@ namespace dvmconsole
             string logLabel,
             bool clearPageStateAfterSend,
             bool sendStartSignal,
-            string messageTitle)
+            string messageTitle,
+            bool includeArmedGroups = false)
         {
             await SendGeneratedTonePayloadAsync(
                 new GeneratedTonePayload { PcmData = pcmData },
@@ -3081,7 +3054,8 @@ namespace dvmconsole
                 logLabel,
                 clearPageStateAfterSend,
                 sendStartSignal,
-                messageTitle);
+                messageTitle,
+                includeArmedGroups: includeArmedGroups);
         }
 
         private async Task SendGeneratedTonePayloadAsync(
@@ -3091,7 +3065,8 @@ namespace dvmconsole
             bool clearPageStateAfterSend,
             bool sendStartSignal,
             string messageTitle,
-            bool forHold = false)
+            bool forHold = false,
+            bool includeArmedGroups = false)
         {
             if (payload?.PcmData == null || payload.PcmData.Length == 0)
                 return;
@@ -3099,6 +3074,8 @@ namespace dvmconsole
             List<ChannelBox> requested = (requestedChannels ?? Enumerable.Empty<ChannelBox>())
                 .Where(channel => channel != null)
                 .ToList();
+            if (includeArmedGroups)
+                requested.AddRange(GetActiveAlertToneGroupTargetChannels());
 
             if (requested.Count == 0)
             {
@@ -3107,16 +3084,11 @@ namespace dvmconsole
             }
 
             List<ChannelBox> channelsToProcess = ResolveAlertToneTransmitTargets(requested);
-            if (!forHold)
-            {
-                patchGroupsWindow.ClearAlertToneTargetStates();
-                activeAlertToneGroupTargets.Clear();
-            }
 
             List<ToneTransmitTarget> targets = new List<ToneTransmitTarget>();
             foreach (ChannelBox channel in channelsToProcess)
             {
-                if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
+                if (channel.IsLocalPlayback)
                     continue;
                 if (forHold && (!channel.IsEnabled || channel.IsReceiving || channel.PttState || channel.PageState))
                     continue;
@@ -3159,11 +3131,63 @@ namespace dvmconsole
                 });
             }
 
-            if (targets.Count == 0)
-                return;
+            List<ToneTransmitGroupSession> groups = includeArmedGroups
+                ? BeginToneTransmitGroups(channelsToProcess)
+                : new List<ToneTransmitGroupSession>();
+            try
+            {
+                if (targets.Count == 0)
+                    return;
 
-            ApplyRxPlaybackMuteForTransmitStart();
-            await Task.WhenAll(targets.Select(target => TransmitTonePayloadToTargetAsync(payload, target, logLabel, clearPageStateAfterSend, sendStartSignal)));
+                ApplyRxPlaybackMuteForTransmitStart();
+                await Task.WhenAll(targets.Select(target => TransmitTonePayloadToTargetAsync(payload, target, logLabel, clearPageStateAfterSend, sendStartSignal, groups)));
+            }
+            finally
+            {
+                CompleteToneTransmitGroups(groups);
+            }
+        }
+
+        private List<ToneTransmitGroupSession> BeginToneTransmitGroups(IEnumerable<ChannelBox> channels)
+        {
+            List<ToneTransmitGroupSession> sessions = new List<ToneTransmitGroupSession>();
+            foreach (var group in activeAlertToneGroupTargets)
+            {
+                if (activeToneTransmitGroups.ContainsKey(group.Key))
+                    continue;
+
+                HashSet<string> memberKeys = group.Value.Select(member => BuildPatchTargetKey(member.SystemName, member.Tgid))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                HashSet<ChannelBox> targets = channels.Where(channel => memberKeys.Contains(
+                    BuildPatchTargetKey(channel.ResourceSystemName, channel.DstId))).ToHashSet();
+                if (targets.Count == 0)
+                    continue;
+
+                ToneTransmitGroupSession session = new ToneTransmitGroupSession
+                {
+                    GroupName = group.Key, Members = group.Value, Targets = targets
+                };
+                sessions.Add(session);
+                activeToneTransmitGroups[group.Key] = session;
+                patchGroupsWindow.SetAlertToneTransmitting(group.Key, true);
+            }
+            return sessions;
+        }
+
+        private void CompleteToneTransmitGroups(IEnumerable<ToneTransmitGroupSession> groups)
+        {
+            foreach (ToneTransmitGroupSession group in groups)
+            {
+                if (activeToneTransmitGroups.TryGetValue(group.GroupName, out var current) && ReferenceEquals(current, group))
+                    activeToneTransmitGroups.Remove(group.GroupName);
+
+                // An operator may have rearmed the group while the previous tone was stopping.
+                if (activeAlertToneGroupTargets.TryGetValue(group.GroupName, out var members) && ReferenceEquals(members, group.Members))
+                {
+                    activeAlertToneGroupTargets.Remove(group.GroupName);
+                    patchGroupsWindow.SetAlertToneTransmitting(group.GroupName, false);
+                }
+            }
         }
 
         private static List<SettingsManager.TonePresetStep> NormalizeToneStackSteps(IEnumerable<SettingsManager.TonePresetStep> steps)
@@ -3263,7 +3287,8 @@ namespace dvmconsole
                 logLabel,
                 clearPageStateAfterSend,
                 sendStartSignal,
-                "DTMF Presets");
+                "DTMF Presets",
+                includeArmedGroups: clearPageStateAfterSend);
         }
 
         private static List<SettingsManager.DtmfPresetStep> NormalizeDtmfStackSteps(IEnumerable<SettingsManager.DtmfPresetStep> steps)
@@ -3390,7 +3415,8 @@ namespace dvmconsole
             ToneTransmitTarget target,
             string logLabel,
             bool clearPageStateAfterSend,
-            bool sendStartSignal)
+            bool sendStartSignal,
+            IReadOnlyList<ToneTransmitGroupSession> groups)
         {
             ChannelBox channel = target.Channel;
             Codeplug.Channel cpgChannel = target.CodeplugChannel;
@@ -3400,7 +3426,7 @@ namespace dvmconsole
             ushort?[] p25ToneFrequenciesByFrame = payload?.P25ToneFrequenciesByFrame;
             bool[] suppressP25ToneDetectionByFrame = payload?.SuppressP25ToneDetectionByFrame;
 
-            if (channel == null || cpgChannel == null || system == null || fne == null || pcmData == null || pcmData.Length == 0)
+            if (!IsGroupTransmitAllowed(channel) || cpgChannel == null || system == null || fne == null || pcmData == null || pcmData.Length == 0)
                 return;
 
             if (!ValidateNxdnTransmit(cpgChannel, channel))
@@ -3420,6 +3446,9 @@ namespace dvmconsole
             uint srcId = uint.Parse(cpgChannel.GetSourceRid(system));
             uint dstId = uint.Parse(cpgChannel.Tgid);
             bool txStarted = false;
+
+            foreach (ToneTransmitGroupSession group in groups.Where(group => group.Targets.Contains(channel)))
+                group.Cancels.Add(toneCancelSource);
 
             try
             {
@@ -3502,6 +3531,8 @@ namespace dvmconsole
                         channel.PageState = false;
                 });
 
+                foreach (ToneTransmitGroupSession group in groups)
+                    group.Cancels.Remove(toneCancelSource);
                 CompleteToneTransmitSession(channel, toneCancelSource);
             }
         }
@@ -3677,21 +3708,18 @@ namespace dvmconsole
             if (!settingsManager.MuteRxAudioWhileTransmitting)
                 return false;
 
-            if (globalPttState)
-                return true;
-
             lock (patchPttSync)
             {
-                if (activePatchPttTargets.Count > 0)
+                if (activePatchPttTargets.Values.Any(s => s.Channel.TxStreamId != 0 && !s.Channel.PttTimedOut))
                     return true;
             }
 
             foreach (ChannelBox channel in selectedChannelsManager.GetSelectedChannels())
             {
-                if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
+                if (channel.IsLocalPlayback)
                     continue;
 
-                if (channel.PttState || channel.TxStreamId != 0 || channel.PatchForwardingTxState)
+                if (channel.IsOperatorTransmitting || channel.TxStreamId != 0 || channel.PatchForwardingTxState)
                     return true;
             }
 
@@ -3868,8 +3896,7 @@ namespace dvmconsole
                 List<ChannelBox> channels = selectedChannelsManager.GetSelectedChannels()
                     .Where(channel => channel.HoldState && channel.IsSelected && channel.IsEnabled &&
                         !channel.IsRxOnly && !channel.IsReceiving && !channel.PttState && !channel.PageState &&
-                        channel.TxStreamId == 0 && channel.SystemName != PLAYBACKSYS &&
-                        channel.ChannelName != PLAYBACKCHNAME && channel.DstId != PLAYBACKTG)
+                        channel.TxStreamId == 0 && !channel.IsLocalPlayback)
                     .ToList();
                 if (channels.Count > 0)
                     await SendGeneratedHoldToneAsync(channels);
@@ -3889,6 +3916,8 @@ namespace dvmconsole
                 PersistSelectedResourceState(saveSettings: false);
 
             isShuttingDown = true;
+            ReleaseAllOperatorPttInputs();
+            StopOperatorPttTimers();
             channelHoldTimer.Stop();
             channelHoldTimer.Elapsed -= OnHoldTimerElapsed;
             channelHoldTimer.Dispose();
@@ -3973,14 +4002,14 @@ namespace dvmconsole
 
                 foreach (ChannelBox channel in selectedChannelsManager.GetSelectedChannels())
                 {
-                    if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
+                    if (channel.IsLocalPlayback)
                         continue;
 
-                    Codeplug.System system = Codeplug.GetSystemForChannel(channel.ChannelName);
+                    Codeplug.System system = Codeplug.GetSystemForChannel(channel.ConfiguredChannel);
                     if (system == null)
                         continue;
 
-                    Codeplug.Channel cpgChannel = Codeplug.GetChannelByName(channel.ChannelName);
+                    Codeplug.Channel cpgChannel = channel.ConfiguredChannel;
                     if (cpgChannel == null)
                         continue;
 
@@ -4216,14 +4245,13 @@ namespace dvmconsole
             List<ChannelBox> selectedChannels = selectedChannelsManager.GetSelectedChannels().ToList();
             bool patchPttActive;
             lock (patchPttSync)
-                patchPttActive = activePatchPttTargets.Count > 0;
+                patchPttActive = activePatchPttTargets.Values.Any(s => s.Channel.TxStreamId == s.StreamId &&
+                    CanSendOperatorPttAudio(s.Channel, s.StreamId));
 
             bool micTransmitActive = patchPttActive || selectedChannels.Any(channel =>
                 channel.IsSelected &&
-                channel.PttState &&
-                channel.SystemName != PLAYBACKSYS &&
-                channel.ChannelName != PLAYBACKCHNAME &&
-                channel.DstId != PLAYBACKTG);
+                channel.PttState && CanSendOperatorPttAudio(channel, channel.TxStreamId) &&
+                !channel.IsLocalPlayback);
 
             // Avoid letting local speaker playback or generated tones train mic processing while the console is idle.
             if (micTransmitActive)
@@ -4239,10 +4267,10 @@ namespace dvmconsole
 
               foreach (ChannelBox channel in selectedChannels)
               {
-                if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
+                if (channel.IsLocalPlayback)
                     continue;
 
-                Codeplug.System system = Codeplug.GetSystemForChannel(channel.ChannelName);
+                Codeplug.System system = Codeplug.GetSystemForChannel(channel.ConfiguredChannel);
                 if (system == null)
                 {
                     Log.WriteLine($"{channel.ChannelName} refers to an {INVALID_SYSTEM} {channel.SystemName}. {ERR_INVALID_CODEPLUG}. {ERR_SKIPPING_AUDIO}.");
@@ -4251,7 +4279,7 @@ namespace dvmconsole
                     continue;
                 }
 
-                Codeplug.Channel cpgChannel = Codeplug.GetChannelByName(channel.ChannelName);
+                Codeplug.Channel cpgChannel = channel.ConfiguredChannel;
                 if (cpgChannel == null)
                 {
                     Log.WriteLine($"{channel.ChannelName} refers to an {INVALID_CODEPLUG_CHANNEL}. {ERR_INVALID_CODEPLUG}. {ERR_SKIPPING_AUDIO}.");
@@ -4276,7 +4304,7 @@ namespace dvmconsole
                 }
 
                 // is the channel selected and in a PTT state?
-                  if (channel.IsSelected && channel.PttState)
+                  if (channel.IsSelected && channel.PttState && CanSendOperatorPttAudio(channel, channel.TxStreamId))
                   {
                       if (!IsFneSystemConnected(system.Name))
                       {
@@ -4295,15 +4323,19 @@ namespace dvmconsole
                       isAnyTgOn = true;
                       transmittedTargets.Add(BuildPatchTargetKey(system.Name, cpgChannel.Tgid));
                       AppendTarTxAudio(system.Name, channel.DstId, channel.TxStreamId, micBuffer);
+                      uint operatorStream = channel.TxStreamId;
                       if (cpgChannel.GetChannelMode() is Codeplug.ChannelMode.NXDN or Codeplug.ChannelMode.Analog)
                       {
                           uint stream = channel.TxStreamId;
                           foreach (byte[] chunk in AudioConverter.SplitToChunks(micBuffer))
                           {
-                              if (cpgChannel.GetChannelMode() == Codeplug.ChannelMode.NXDN)
-                                  NXDNEncodeAudioFrame(chunk, fne, channel, cpgChannel, system, expectedStreamId: stream);
-                              else if (chunk.Length == PCM_SAMPLES_LENGTH)
-                                  AnalogEncodeAudioFrame(chunk, fne, channel, cpgChannel, system, expectedStreamId: stream);
+                              SendOperatorPttFrame(channel, stream, () =>
+                              {
+                                  if (cpgChannel.GetChannelMode() == Codeplug.ChannelMode.NXDN)
+                                      NXDNEncodeAudioFrame(chunk, fne, channel, cpgChannel, system, expectedStreamId: stream);
+                                  else if (chunk.Length == PCM_SAMPLES_LENGTH)
+                                      AnalogEncodeAudioFrame(chunk, fne, channel, cpgChannel, system, expectedStreamId: stream);
+                              });
                           }
                           continue;
                       }
@@ -4314,10 +4346,13 @@ namespace dvmconsole
                           {
                               if (chunk.Length == PCM_SAMPLES_LENGTH)
                               {
-                                  if (cpgChannel.GetChannelMode() == Codeplug.ChannelMode.P25)
-                                      P25EncodeAudioFrame(chunk, fne, channel, cpgChannel, system);
-                                else if (cpgChannel.GetChannelMode() == Codeplug.ChannelMode.DMR)
-                                    DMREncodeAudioFrame(chunk, fne, channel, cpgChannel, system);
+                                  SendOperatorPttFrame(channel, operatorStream, () =>
+                                  {
+                                      if (cpgChannel.GetChannelMode() == Codeplug.ChannelMode.P25)
+                                          P25EncodeAudioFrame(chunk, fne, channel, cpgChannel, system);
+                                      else if (cpgChannel.GetChannelMode() == Codeplug.ChannelMode.DMR)
+                                          DMREncodeAudioFrame(chunk, fne, channel, cpgChannel, system);
+                                  });
                             }
                             else
                                 Log.WriteLine("bad sample length: " + chunk.Length);
@@ -4516,6 +4551,7 @@ namespace dvmconsole
             StopNxdnChannels();
             StopAnalogChannels();
             ClearNxdnKeys();
+            ClearLocalKeys();
             StopAllWebStreams();
             ShutdownAlertToneScheduler();
             ShutdownToolbarClocks();
@@ -5107,7 +5143,7 @@ namespace dvmconsole
                     return new AlertToneManagerWindow.AlertToneTargetItem
                     {
                         Key = group.Key,
-                        DisplayName = $"{channel.ChannelName} ({NormalizeChannelSystemName(channel.SystemName)} TG {channel.DstId})"
+                        DisplayName = $"{channel.ChannelName} ({channel.ResourceSystemName} TG {channel.DstId})"
                     };
                 })
                 .OrderBy(target => target.DisplayName, StringComparer.OrdinalIgnoreCase)
@@ -5118,9 +5154,7 @@ namespace dvmconsole
         {
             return channel != null &&
                    !channel.IsRxOnly &&
-                   channel.SystemName != PLAYBACKSYS &&
-                   channel.ChannelName != PLAYBACKCHNAME &&
-                   channel.DstId != PLAYBACKTG;
+                   !channel.IsLocalPlayback;
         }
 
         private static SettingsManager.AlertToneScheduleConfig ToAlertToneScheduleConfig(AlertToneManagerWindow.AlertToneScheduleManagerItem item)
@@ -5163,6 +5197,7 @@ namespace dvmconsole
             List<ChannelBox> pageSelectedChannels = selectedChannels
                 .Where(channel => channel.PageState)
                 .ToList();
+            pageSelectedChannels = ResolveAlertToneTransmitTargets(pageSelectedChannels.Concat(GetActiveAlertToneGroupTargetChannels()));
 
             if (pageSelectedChannels.Count > 0)
             {
@@ -5180,7 +5215,7 @@ namespace dvmconsole
                 targets.Add(new TonePresetManagerWindow.TonePresetTargetItem
                 {
                     Key = BuildChannelSelectionKey(channel),
-                    DisplayName = $"{channel.ChannelName} ({NormalizeChannelSystemName(channel.SystemName)} TG {channel.DstId})",
+                    DisplayName = $"{channel.ChannelName} ({channel.ResourceSystemName} TG {channel.DstId})",
                     Channels = new List<ChannelBox> { channel },
                     ClearPageStateAfterSend = false
                 });
@@ -5194,9 +5229,7 @@ namespace dvmconsole
             return channel != null &&
                    channel.IsSelected &&
                    !channel.IsRxOnly &&
-                   channel.SystemName != PLAYBACKSYS &&
-                   channel.ChannelName != PLAYBACKCHNAME &&
-                   channel.DstId != PLAYBACKTG;
+                   !channel.IsLocalPlayback;
         }
 
         private void SaveTonePresetManagerItems(IReadOnlyList<TonePresetManagerWindow.TonePresetManagerItem> items)
@@ -5266,6 +5299,7 @@ namespace dvmconsole
             List<ChannelBox> pageSelectedChannels = selectedChannels
                 .Where(channel => channel.PageState)
                 .ToList();
+            pageSelectedChannels = ResolveAlertToneTransmitTargets(pageSelectedChannels.Concat(GetActiveAlertToneGroupTargetChannels()));
 
             if (pageSelectedChannels.Count > 0)
             {
@@ -5283,7 +5317,7 @@ namespace dvmconsole
                 targets.Add(new DtmfPresetManagerWindow.DtmfPresetTargetItem
                 {
                     Key = BuildChannelSelectionKey(channel),
-                    DisplayName = $"{channel.ChannelName} ({NormalizeChannelSystemName(channel.SystemName)} TG {channel.DstId})",
+                    DisplayName = $"{channel.ChannelName} ({channel.ResourceSystemName} TG {channel.DstId})",
                     Channels = new List<ChannelBox> { channel },
                     ClearPageStateAfterSend = false
                 });
@@ -5801,7 +5835,7 @@ namespace dvmconsole
         /// <param name="e"></param>
         private void ChannelBox_HoldChannelButtonClicked(object sender, ChannelBox e)
         {
-            if (e.SystemName == PLAYBACKSYS || e.ChannelName == PLAYBACKCHNAME || e.DstId == PLAYBACKTG)
+            if (e.IsLocalPlayback)
                 return;
 
             if (!e.HoldState)
@@ -5816,7 +5850,7 @@ namespace dvmconsole
             if (e == null)
                 return;
 
-            Codeplug.Channel cpgChannel = Codeplug?.GetChannelByName(e.ChannelName);
+            Codeplug.Channel cpgChannel = e.ConfiguredChannel;
             if (cpgChannel == null || !cpgChannel.SelectableEncryption || !cpgChannel.HasSelectableTxProtection())
                 return;
 
@@ -5832,7 +5866,7 @@ namespace dvmconsole
         /// <param name="e"></param>
         private void ChannelBox_PageButtonClicked(object sender, ChannelBox e)
         {
-            if (e.SystemName == PLAYBACKSYS || e.ChannelName == PLAYBACKCHNAME || e.DstId == PLAYBACKTG)
+            if (e.IsLocalPlayback)
                 return;
 
             if (!TryResolveChannelEndpoint(e, out Codeplug.Channel cpgChannel, out Codeplug.System system, out PeerSystem fne, out string endpointError))
@@ -5879,10 +5913,12 @@ namespace dvmconsole
         /// <param name="e"></param>
         private void ChannelBox_PTTButtonClicked(object sender, ChannelBox e)
         {
-            if (e.SystemName == PLAYBACKSYS || e.ChannelName == PLAYBACKCHNAME || e.DstId == PLAYBACKTG)
+            if (e.IsLocalPlayback)
+                return;
+            if (!e.PttState && e.TxStreamId == 0)
                 return;
 
-            Codeplug.System system = Codeplug.GetSystemForChannel(e.ChannelName);
+            Codeplug.System system = Codeplug.GetSystemForChannel(e.ConfiguredChannel);
             if (system == null)
             {
                 MessageBox.Show($"{e.ChannelName} refers to an {INVALID_SYSTEM} {e.SystemName}. {PLEASE_CHECK_CODEPLUG}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
@@ -5891,7 +5927,7 @@ namespace dvmconsole
                 return;
             }
 
-            Codeplug.Channel cpgChannel = Codeplug.GetChannelByName(e.ChannelName);
+            Codeplug.Channel cpgChannel = e.ConfiguredChannel;
             if (cpgChannel == null)
             {
                 // bryanb: this should actually never happen...
@@ -5918,7 +5954,7 @@ namespace dvmconsole
                 return;
             }
 
-            if (!e.IsSelected)
+            if (!e.IsSelected && e.PttState)
                 return;
 
             FneUtils.Memset(e.mi, 0x00, P25Defines.P25_MI_LENGTH);
@@ -5951,6 +5987,7 @@ namespace dvmconsole
                     Log.WriteWarning($"{e.ChannelName} CHANNEL still had a TxStreamId? This shouldn't happen.");
 
                 e.TxStreamId = fne.NewStreamId();
+                StartOperatorPtt(e);
                 Log.WriteLine($"({system.Name}) {e.ChannelMode.ToUpperInvariant()} Traffic *CALL START     * SRC_ID {srcId} TGID {dstId} [STREAM ID {e.TxStreamId}]");
                 e.VolumeMeterLevel = 0;
                 BeginTarTxRecording(e, system, cpgChannel, e.TxStreamId);
@@ -5962,6 +5999,7 @@ namespace dvmconsole
             }
             else
             {
+                StopOperatorPtt(e);
                 e.VolumeMeterLevel = 0;
                 Log.WriteLine($"({system.Name}) {e.ChannelMode.ToUpperInvariant()} Traffic *CALL END       * SRC_ID {srcId} TGID {dstId} [STREAM ID {e.TxStreamId}]");
                 EndTarTxRecording(e, system, cpgChannel);
@@ -5978,171 +6016,6 @@ namespace dvmconsole
                 }
 
                 // reset values
-                ResetChannel(e);
-            }
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        /// <exception cref="NotImplementedException"></exception>
-        private void ChannelBox_PTTButtonPressed(object sender, ChannelBox e)
-        {
-            if (e.SystemName == PLAYBACKSYS || e.ChannelName == PLAYBACKCHNAME || e.DstId == PLAYBACKTG)
-                return;
-
-            if (!e.PttState)
-            {
-                Codeplug.System system = Codeplug.GetSystemForChannel(e.ChannelName);
-                if (system == null)
-                {
-                    MessageBox.Show($"{e.ChannelName} refers to an {INVALID_SYSTEM} {e.SystemName}. {PLEASE_CHECK_CODEPLUG}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    e.IsSelected = false;
-                    selectedChannelsManager.RemoveSelectedChannel(e);
-                    return;
-                }
-
-                Codeplug.Channel cpgChannel = Codeplug.GetChannelByName(e.ChannelName);
-                if (cpgChannel == null)
-                {
-                    // bryanb: this should actually never happen...
-                    MessageBox.Show($"{e.ChannelName} refers to an {INVALID_CODEPLUG_CHANNEL}. {PLEASE_CHECK_CODEPLUG}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    e.IsSelected = false;
-                    selectedChannelsManager.RemoveSelectedChannel(e);
-                    return;
-                }
-
-                PeerSystem fne = fneSystemManager.GetFneSystem(system.Name);
-                if (fne == null)
-                {
-                    if (TryHandleDisconnectedFneEndpoint(e, system, $"PTT press {e.ChannelName}"))
-                    {
-                        e.PttState = false;
-                        e.VolumeMeterLevel = 0;
-                        ResetChannel(e);
-                        return;
-                    }
-
-                    MessageBox.Show($"{e.ChannelName} has a {ERR_INVALID_FNE_REF}. {PLEASE_RESTART_CONSOLE}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    e.IsSelected = false;
-                    selectedChannelsManager.RemoveSelectedChannel(e);
-                    return;
-                }
-
-                if (!e.IsSelected)
-                    return;
-
-                FneUtils.Memset(e.mi, 0x00, P25Defines.P25_MI_LENGTH);
-
-                if (!ValidateFneConnectionAvailable(system.Name, e, current =>
-                {
-                    current.PttState = false;
-                    ResetChannel(current);
-                    current.VolumeMeterLevel = 0;
-                }))
-                    return;
-
-                if (!ValidateTalkgroupAvailability(fne, cpgChannel, e, current =>
-                {
-                    current.PttState = false;
-                    ResetChannel(current);
-                    current.VolumeMeterLevel = 0;
-                }))
-                    return;
-
-                EnsureAudioInputCaptureHealthy("channel PTT start");
-                ApplyRxPlaybackMuteForTransmitStart();
-
-                uint srcId = uint.Parse(cpgChannel.GetSourceRid(system));
-                uint dstId = uint.Parse(cpgChannel.Tgid);
-
-                if (e.TxStreamId != 0)
-                    Log.WriteWarning($"{e.ChannelName} CHANNEL still had a TxStreamId? This shouldn't happen.");
-
-                e.TxStreamId = fne.NewStreamId();
-                Log.WriteLine($"({system.Name}) {e.ChannelMode.ToUpperInvariant()} Traffic *CALL START     * SRC_ID {srcId} TGID {dstId} [STREAM ID {e.TxStreamId}]");
-                e.VolumeMeterLevel = 0;
-                BeginTarTxRecording(e, system, cpgChannel, e.TxStreamId);
-
-                if (cpgChannel.GetChannelMode() == Codeplug.ChannelMode.P25)
-                    fne.SendP25TDU(srcId, dstId, true);
-
-                PlayTalkPermitTone();
-            }
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        /// <exception cref="NotImplementedException"></exception>
-        private void ChannelBox_PTTButtonReleased(object sender, ChannelBox e)
-        {
-            if (e.SystemName == PLAYBACKSYS || e.ChannelName == PLAYBACKCHNAME || e.DstId == PLAYBACKTG)
-                return;
-
-            if (e.PttState)
-            {
-                Codeplug.System system = Codeplug.GetSystemForChannel(e.ChannelName);
-                if (system == null)
-                {
-                    MessageBox.Show($"{e.ChannelName} refers to an {INVALID_SYSTEM} {e.SystemName}. {PLEASE_CHECK_CODEPLUG}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    e.IsSelected = false;
-                    selectedChannelsManager.RemoveSelectedChannel(e);
-                    return;
-                }
-
-                Codeplug.Channel cpgChannel = Codeplug.GetChannelByName(e.ChannelName);
-                if (cpgChannel == null)
-                {
-                    // bryanb: this should actually never happen...
-                    MessageBox.Show($"{e.ChannelName} refers to an {INVALID_CODEPLUG_CHANNEL}. {PLEASE_CHECK_CODEPLUG}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    e.IsSelected = false;
-                    selectedChannelsManager.RemoveSelectedChannel(e);
-                    return;
-                }
-
-                PeerSystem fne = fneSystemManager.GetFneSystem(system.Name);
-                if (fne == null)
-                {
-                    if (TryHandleDisconnectedFneEndpoint(e, system, $"PTT release {e.ChannelName}"))
-                    {
-                        e.PttState = false;
-                        e.VolumeMeterLevel = 0;
-                        ResetChannel(e);
-                        return;
-                    }
-
-                    MessageBox.Show($"{e.ChannelName} has a {ERR_INVALID_FNE_REF}. {PLEASE_RESTART_CONSOLE}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    e.IsSelected = false;
-                    selectedChannelsManager.RemoveSelectedChannel(e);
-                    return;
-                }
-
-                if (!e.IsSelected)
-                    return;
-
-                uint srcId = uint.Parse(cpgChannel.GetSourceRid(system));
-                uint dstId = uint.Parse(cpgChannel.Tgid);
-
-                Log.WriteLine($"({system.Name}) {e.ChannelMode.ToUpperInvariant()} Traffic *CALL END       * SRC_ID {srcId} TGID {dstId} [STREAM ID {e.TxStreamId}]");
-                e.VolumeMeterLevel = 0;
-                EndTarTxRecording(e, system, cpgChannel);
-                if (IsFneSystemConnected(system.Name))
-                {
-                    if (cpgChannel.GetChannelMode() == Codeplug.ChannelMode.P25)
-                        fne.SendP25TDU(srcId, dstId, false);
-                    else if (cpgChannel.GetChannelMode() == Codeplug.ChannelMode.DMR)
-                        EndDmrTransmission(e);
-                }
-                else
-                {
-                    Log.WriteWarning($"Call end network signal skipped for {e.ChannelName}; FNE system '{system.Name}' is disconnected.");
-                }
-
                 ResetChannel(e);
             }
         }
@@ -6326,7 +6199,7 @@ namespace dvmconsole
             ChannelBox dragSource = channelDragSource;
             if (dragSource == null || e.LeftButton != MouseButtonState.Pressed)
                 return;
-            if (dragSource.SystemName == PLAYBACKSYS || dragSource.ChannelName == PLAYBACKCHNAME || dragSource.DstId == PLAYBACKTG)
+            if (dragSource.IsLocalPlayback)
                 return;
 
             Point currentPosition = e.GetPosition(null);
@@ -6337,7 +6210,7 @@ namespace dvmconsole
 
             channelDragMoved = true;
 
-            string systemName = NormalizeChannelSystemName(dragSource.SystemName);
+            string systemName = dragSource.ResourceSystemName;
             string tgid = dragSource.DstId?.Trim();
             if (string.IsNullOrWhiteSpace(systemName) || string.IsNullOrWhiteSpace(tgid))
                 return;
@@ -6455,21 +6328,7 @@ namespace dvmconsole
                 return false;
             }
 
-            string systemName = NormalizeChannelSystemName(channel.SystemName);
-            string tgid = channel.DstId?.Trim() ?? string.Empty;
-
-            Codeplug.Channel resolvedChannel = GetConfiguredChannels()
-                .FirstOrDefault(c =>
-                    ResourceIdentity.SystemMatches(c.System, systemName) &&
-                    string.Equals(c.Tgid?.Trim() ?? string.Empty, tgid, StringComparison.OrdinalIgnoreCase));
-
-            if (resolvedChannel == null)
-            {
-                resolvedChannel = GetConfiguredChannels()
-                    .FirstOrDefault(c =>
-                        ResourceIdentity.SystemMatches(c.System, systemName) &&
-                        string.Equals(c.Name?.Trim() ?? string.Empty, channel.ChannelName?.Trim() ?? string.Empty, StringComparison.OrdinalIgnoreCase));
-            }
+            Codeplug.Channel resolvedChannel = channel.ConfiguredChannel;
 
             if (resolvedChannel == null)
             {
@@ -6478,11 +6337,10 @@ namespace dvmconsole
             }
 
             cpgChannel = resolvedChannel;
-            string resolvedSystemName = resolvedChannel.System;
-            system = Codeplug?.Systems?.FirstOrDefault(s => ResourceIdentity.SystemMatches(s.Name, resolvedSystemName));
+            system = Codeplug?.GetSystemForChannel(resolvedChannel);
             if (system == null)
             {
-                failureMessage = $"{channel.ChannelName} refers to an {INVALID_SYSTEM} {systemName}. {ERR_INVALID_CODEPLUG}.";
+                failureMessage = $"{channel.ChannelName} refers to an {INVALID_SYSTEM} {resolvedChannel.System}. {ERR_INVALID_CODEPLUG}.";
                 return false;
             }
 
@@ -6509,7 +6367,7 @@ namespace dvmconsole
             if (channel == null)
                 return string.Empty;
 
-            return ResourceIdentity.Build(NormalizeChannelSystemName(channel.SystemName), channel.DstId);
+            return ResourceIdentity.Build(channel.ResourceSystemName, channel.DstId);
         }
 
         private void PersistSelectedResourceState(bool saveSettings = true)
@@ -6517,7 +6375,7 @@ namespace dvmconsole
             if (settingsManager.RestoreSelectedChannelsOnStartup)
             {
                 settingsManager.SelectedChannels = GetSelectedChannelsForPersistence()
-                    .Where(c => c.SystemName != PLAYBACKSYS && c.ChannelName != PLAYBACKCHNAME && c.DstId != PLAYBACKTG)
+                    .Where(c => !c.IsLocalPlayback)
                     .Select(BuildChannelSelectionKey)
                     .Where(key => !string.IsNullOrWhiteSpace(key))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -6678,7 +6536,7 @@ namespace dvmconsole
             if (channel == null)
                 return PatchGroupsWindow.PatchTalkgroupState.Idle;
 
-            if (channel.PttState)
+            if (channel.IsOperatorTransmitting)
                 return PatchGroupsWindow.PatchTalkgroupState.Transmitting;
             if (channel.IsReceiving || channel.IsReceivingEncrypted)
                 return PatchGroupsWindow.PatchTalkgroupState.Receiving;
@@ -6686,9 +6544,10 @@ namespace dvmconsole
         }
 
         /// <summary>
-        /// Finds a channel widget by channel name.
+        /// Finds a channel widget by its configured system and talkgroup.
         /// </summary>
-        /// <param name="channelName"></param>
+        /// <param name="systemName"></param>
+        /// <param name="tgid"></param>
         /// <returns></returns>
         private ChannelBox FindChannelBySystemAndTgid(string systemName, string tgid)
         {
@@ -6696,7 +6555,7 @@ namespace dvmconsole
             {
                 ChannelBox found = canvas.Children
                     .OfType<ChannelBox>()
-                    .FirstOrDefault(c => NormalizeChannelSystemName(c.SystemName) == systemName && (c.DstId?.Trim() ?? string.Empty) == (tgid?.Trim() ?? string.Empty));
+                    .FirstOrDefault(c => ChannelMatchesResource(c, systemName, tgid));
                 if (found != null)
                     return found;
             }
@@ -6727,12 +6586,12 @@ namespace dvmconsole
         /// </summary>
         private static bool ChannelMatchesResource(ChannelBox channel, string systemName, string tgid)
         {
-            if (channel == null)
+            if (channel?.ConfiguredChannel == null)
                 return false;
 
-            return ResourceIdentity.SystemMatches(NormalizeChannelSystemName(channel.SystemName), systemName) &&
+            return ResourceIdentity.SystemMatches(channel.ConfiguredChannel.System, systemName) &&
                 string.Equals(
-                    channel.DstId?.Trim() ?? string.Empty,
+                    channel.ConfiguredChannel.Tgid?.Trim() ?? string.Empty,
                     tgid?.Trim() ?? string.Empty,
                     StringComparison.OrdinalIgnoreCase);
         }
@@ -6828,11 +6687,11 @@ namespace dvmconsole
                 {
                     if (channel == null || channel.RxStreamId == 0 || !(channel.IsReceiving || channel.IsReceivingEncrypted))
                         continue;
-                    if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
+                    if (channel.IsLocalPlayback)
                         continue;
 
-                    Codeplug.Channel cpgChannel = Codeplug?.GetChannelByName(channel.ChannelName);
-                    Codeplug.System system = cpgChannel == null ? null : Codeplug?.GetSystemForChannel(channel.ChannelName);
+                    Codeplug.Channel cpgChannel = channel.ConfiguredChannel;
+                    Codeplug.System system = cpgChannel == null ? null : Codeplug?.GetSystemForChannel(channel.ConfiguredChannel);
                     if (cpgChannel == null || system == null)
                         continue;
                     if (!activePatchMembers.Contains(BuildPatchTargetKey(system.Name, cpgChannel.Tgid)))
@@ -6954,13 +6813,13 @@ namespace dvmconsole
             {
                 foreach (ChannelBox channel in canvas.Children.OfType<ChannelBox>())
                 {
-                    if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
+                    if (channel.IsLocalPlayback)
                     {
                         channel.SetPatchMembershipIndicator(false, false);
                         continue;
                     }
 
-                    string channelKey = BuildPatchTargetKey(NormalizeChannelSystemName(channel.SystemName), channel.DstId);
+                    string channelKey = BuildPatchTargetKey(channel.ResourceSystemName, channel.DstId);
                     channel.SetPatchMembershipIndicator(patchMembers.Contains(channelKey), activePatchMembers.Contains(channelKey));
                 }
 
@@ -6981,13 +6840,13 @@ namespace dvmconsole
             {
                 foreach (ChannelBox channel in canvas.Children.OfType<ChannelBox>())
                 {
-                    if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
+                    if (channel.IsLocalPlayback)
                     {
                         channel.SetMultiSelectIndicator(false);
                         continue;
                     }
 
-                    string channelKey = BuildPatchTargetKey(NormalizeChannelSystemName(channel.SystemName), channel.DstId);
+                    string channelKey = BuildPatchTargetKey(channel.ResourceSystemName, channel.DstId);
                     channel.SetMultiSelectIndicator(multiSelectMembers.Contains(channelKey));
                 }
             }
@@ -7035,6 +6894,12 @@ namespace dvmconsole
             else
             {
                 activeAlertToneGroupTargets.Remove(groupName);
+                if (activeToneTransmitGroups.TryGetValue(groupName, out ToneTransmitGroupSession session))
+                {
+                    // Cancel only this group's tone legs, not unrelated PTT or later calls.
+                    foreach (CancellationTokenSource cancelSource in session.Cancels.ToArray())
+                        cancelSource.Cancel();
+                }
             }
 
             foreach (SettingsManager.PatchTalkgroupMember member in e.Members ?? new List<SettingsManager.PatchTalkgroupMember>())
@@ -7042,7 +6907,7 @@ namespace dvmconsole
                 if (!TryResolvePatchEndpoint(member.SystemName, member.Tgid, out ChannelBox channelBox, out _, out _, out _))
                     continue;
 
-                channelBox.PageState = e.IsActive || IsAlertToneGroupTargetStillActive(member);
+                channelBox.PageState = IsGroupTransmitAllowed(channelBox) && (e.IsActive || IsAlertToneGroupTargetStillActive(member));
             }
         }
 
@@ -7063,8 +6928,13 @@ namespace dvmconsole
 
                 if (!TryResolvePatchEndpoint(systemName, tgid, out ChannelBox channelBox, out Codeplug.Channel cpgChannel, out Codeplug.System system, out PeerSystem fne))
                     continue;
-                if (cpgChannel.RxOnly || channelBox.IsRxOnly)
+                if (!IsGroupTransmitAllowed(channelBox))
                     continue;
+                if (channelBox.PttTimedOut)
+                {
+                    PlayTransmitTimeoutAlert(true);
+                    continue;
+                }
 
                 if (!ValidateFneConnectionAvailable(system.Name, channelBox, null, showWarning: false))
                     continue;
@@ -7086,6 +6956,7 @@ namespace dvmconsole
 
                 FneUtils.Memset(channelBox.mi, 0x00, P25Defines.P25_MI_LENGTH);
                 channelBox.TxStreamId = fne.NewStreamId();
+                StartOperatorPtt(channelBox);
                 channelBox.PatchForwardingTxState = true;
                 channelBox.VolumeMeterLevel = 0;
 
@@ -7109,7 +6980,8 @@ namespace dvmconsole
                         CodeplugChannel = cpgChannel,
                         CodeplugSystem = system,
                         Fne = fne,
-                        SourceId = sourceId
+                        SourceId = sourceId,
+                        StreamId = channelBox.TxStreamId
                     };
                 }
             }
@@ -7132,7 +7004,12 @@ namespace dvmconsole
             }
 
             foreach (PatchPttTargetSession session in sessionsToStop)
+            {
+                if (!session.Channel.PttState)
+                    session.Channel.PttTimedOut = false;
                 StopPatchPttSession(session);
+            }
+            patchGroupsWindow.SetPttTimedOut(groupName, false);
         }
 
         /// <summary>
@@ -7148,7 +7025,31 @@ namespace dvmconsole
             }
 
             foreach (PatchPttTargetSession session in sessionsToStop)
+            {
+                if (!session.Channel.PttState)
+                    session.Channel.PttTimedOut = false;
                 StopPatchPttSession(session);
+                patchGroupsWindow.SetPttTimedOut(session.GroupName, false);
+            }
+        }
+
+        /// <summary>
+        /// Releases only this resource's group PTT and patch forwarding legs when it is deselected.
+        /// </summary>
+        private void StopGroupTransmissionsForChannel(ChannelBox channel)
+        {
+            string key = BuildPatchTargetKey(channel.ResourceSystemName, channel.DstId);
+            PatchPttTargetSession session;
+            lock (patchPttSync)
+                activePatchPttTargets.Remove(key, out session);
+
+            if (session != null)
+            {
+                if (!channel.PttState)
+                    channel.PttTimedOut = false;
+                StopPatchPttSession(session);
+            }
+            patchManager?.StopMember(channel.ResourceSystemName, channel.DstId);
         }
 
         /// <summary>
@@ -7156,9 +7057,11 @@ namespace dvmconsole
         /// </summary>
         private void StopPatchPttSession(PatchPttTargetSession session)
         {
-            if (session?.Channel == null || session.CodeplugChannel == null || session.CodeplugSystem == null || session.Fne == null || session.Channel.TxStreamId == 0)
+            if (session?.Channel == null || session.CodeplugChannel == null || session.CodeplugSystem == null || session.Fne == null ||
+                session.Channel.TxStreamId == 0 || session.Channel.TxStreamId != session.StreamId)
                 return;
 
+            StopOperatorPtt(session.Channel);
             uint dstId = uint.Parse(session.CodeplugChannel.Tgid);
             Log.WriteLine($"({session.CodeplugSystem.Name}) {session.CodeplugChannel.GetChannelMode().ToString().ToUpperInvariant()} Traffic *CALL END       * SRC_ID {session.SourceId} TGID {dstId} [STREAM ID {session.Channel.TxStreamId}] (Patch PTT: {session.GroupName})");
             EndTarTxRecording(session.Channel, session.CodeplugSystem, session.CodeplugChannel);
@@ -7191,7 +7094,12 @@ namespace dvmconsole
 
             foreach (PatchPttTargetSession session in sessions)
             {
-                if (session.Channel == null || session.CodeplugChannel == null || session.CodeplugSystem == null || session.Fne == null || session.Channel.TxStreamId == 0)
+                if (session.Channel == null || session.CodeplugChannel == null || session.CodeplugSystem == null || session.Fne == null ||
+                    session.Channel.TxStreamId == 0 || session.Channel.TxStreamId != session.StreamId)
+                    continue;
+                if (!IsGroupTransmitAllowed(session.Channel))
+                    continue;
+                if (!CanSendOperatorPttAudio(session.Channel, session.Channel.TxStreamId))
                     continue;
                 if (alreadySentTargets.Contains(session.Key))
                     continue;
@@ -7199,16 +7107,21 @@ namespace dvmconsole
                     continue;
 
                 alreadySentTargets.Add(session.Key);
+                uint stream = session.Channel.TxStreamId;
                 AppendTarTxAudio(session.CodeplugSystem.Name, session.CodeplugChannel.Tgid, session.Channel.TxStreamId, pcmBuffer);
                 if (session.CodeplugChannel.GetChannelMode() is Codeplug.ChannelMode.NXDN or Codeplug.ChannelMode.Analog)
                 {
-                    uint stream = session.Channel.TxStreamId;
                     foreach (byte[] chunk in AudioConverter.SplitToChunks(pcmBuffer))
                     {
-                        if (session.CodeplugChannel.GetChannelMode() == Codeplug.ChannelMode.NXDN)
-                            NXDNEncodeAudioFrame(chunk, session.Fne, session.Channel, session.CodeplugChannel, session.CodeplugSystem, expectedStreamId: stream);
-                        else if (chunk.Length == PCM_SAMPLES_LENGTH)
-                            AnalogEncodeAudioFrame(chunk, session.Fne, session.Channel, session.CodeplugChannel, session.CodeplugSystem, expectedStreamId: stream);
+                        if (!IsGroupTransmitAllowed(session.Channel) || session.Channel.TxStreamId != stream)
+                            break;
+                        SendOperatorPttFrame(session.Channel, stream, () =>
+                        {
+                            if (session.CodeplugChannel.GetChannelMode() == Codeplug.ChannelMode.NXDN)
+                                NXDNEncodeAudioFrame(chunk, session.Fne, session.Channel, session.CodeplugChannel, session.CodeplugSystem, expectedStreamId: stream);
+                            else if (chunk.Length == PCM_SAMPLES_LENGTH)
+                                AnalogEncodeAudioFrame(chunk, session.Fne, session.Channel, session.CodeplugChannel, session.CodeplugSystem, expectedStreamId: stream);
+                        });
                     }
                     continue;
                 }
@@ -7218,13 +7131,18 @@ namespace dvmconsole
                     List<byte[]> chunks = AudioConverter.SplitToChunks(pcmBuffer);
                     foreach (byte[] chunk in chunks)
                     {
+                        if (!IsGroupTransmitAllowed(session.Channel) || session.Channel.TxStreamId != stream)
+                            break;
                         if (chunk.Length != PCM_SAMPLES_LENGTH)
                             continue;
 
-                        if (session.CodeplugChannel.GetChannelMode() == Codeplug.ChannelMode.P25)
-                            P25EncodeAudioFrame(chunk, session.Fne, session.Channel, session.CodeplugChannel, session.CodeplugSystem);
-                        else if (session.CodeplugChannel.GetChannelMode() == Codeplug.ChannelMode.DMR)
-                            DMREncodeAudioFrame(chunk, session.Fne, session.Channel, session.CodeplugChannel, session.CodeplugSystem);
+                        SendOperatorPttFrame(session.Channel, stream, () =>
+                        {
+                            if (session.CodeplugChannel.GetChannelMode() == Codeplug.ChannelMode.P25)
+                                P25EncodeAudioFrame(chunk, session.Fne, session.Channel, session.CodeplugChannel, session.CodeplugSystem);
+                            else if (session.CodeplugChannel.GetChannelMode() == Codeplug.ChannelMode.DMR)
+                                DMREncodeAudioFrame(chunk, session.Fne, session.Channel, session.CodeplugChannel, session.CodeplugSystem);
+                        });
                     }
                 });
             }
@@ -7237,7 +7155,8 @@ namespace dvmconsole
         {
             string key = BuildPatchTargetKey(systemName, tgid);
             lock (patchPttSync)
-                return activePatchPttTargets.ContainsKey(key);
+                return activePatchPttTargets.TryGetValue(key, out PatchPttTargetSession session) &&
+                    session.Channel.TxStreamId != 0 && session.Channel.TxStreamId == session.StreamId && !session.Channel.PttTimedOut;
         }
 
         /// <summary>
@@ -7263,10 +7182,7 @@ namespace dvmconsole
         private bool TryResolvePatchEndpoint(string systemName, string tgid, out ChannelBox channelBox, out Codeplug.Channel cpgChannel, out Codeplug.System system, out PeerSystem fne)
         {
             channelBox = FindChannelBySystemAndTgid(systemName, tgid);
-            cpgChannel = GetConfiguredChannels().FirstOrDefault(c => (c.System?.Trim() ?? string.Empty) == (systemName?.Trim() ?? string.Empty) && (c.Tgid?.Trim() ?? string.Empty) == (tgid?.Trim() ?? string.Empty));
-            system = Codeplug?.Systems?.FirstOrDefault(s => (s.Name?.Trim() ?? string.Empty) == (systemName?.Trim() ?? string.Empty));
-            fne = system == null ? null : fneSystemManager.GetFneSystem(system.Name);
-            return channelBox != null && cpgChannel != null && system != null && fne != null;
+            return TryResolveChannelEndpoint(channelBox, out cpgChannel, out system, out fne, out _);
         }
 
         /// <summary>
@@ -7279,9 +7195,8 @@ namespace dvmconsole
                 Log.WriteWarning($"Patch forward target unavailable: {systemName} TG {tgid} could not be resolved.");
                 return 0;
             }
-            if (cpgChannel.RxOnly || channelBox.IsRxOnly)
+            if (!IsGroupTransmitAllowed(channelBox))
             {
-                Log.WriteWarning($"Patch forward target blocked: {channelBox.ChannelName} ({systemName} TG {tgid}) is RX-only.");
                 return 0;
             }
 
@@ -7338,7 +7253,7 @@ namespace dvmconsole
         {
             if (!TryResolvePatchEndpoint(systemName, tgid, out ChannelBox channelBox, out Codeplug.Channel cpgChannel, out Codeplug.System system, out PeerSystem fne))
                 return;
-            if (channelBox.TxStreamId == 0)
+            if (channelBox.TxStreamId == 0 || channelBox.TxStreamId != streamId)
                 return;
 
             uint dstId = uint.Parse(cpgChannel.Tgid);
@@ -7381,7 +7296,7 @@ namespace dvmconsole
         {
             if (!TryResolvePatchEndpoint(systemName, tgid, out ChannelBox channelBox, out Codeplug.Channel cpgChannel, out Codeplug.System system, out PeerSystem fne))
                 return;
-            if (channelBox.TxStreamId == 0)
+            if (!IsGroupTransmitAllowed(channelBox) || channelBox.TxStreamId == 0)
                 return;
             if (!IsFneSystemConnected(system.Name))
                 return;
@@ -7415,16 +7330,12 @@ namespace dvmconsole
         /// </summary>
         private uint GetPatchFallbackSourceId(string systemName, string tgid)
         {
-            if (Codeplug?.Systems == null)
-                return 0;
-
-            Codeplug.System system = Codeplug.Systems.FirstOrDefault(s => (s.Name?.Trim() ?? string.Empty) == (systemName?.Trim() ?? string.Empty));
+            Codeplug.Channel channel = FindChannelBySystemAndTgid(systemName, tgid)?.ConfiguredChannel;
+            Codeplug.System system = Codeplug?.GetSystemForChannel(channel);
             if (system == null || string.IsNullOrWhiteSpace(system.Rid))
                 return 0;
 
-            Codeplug.Channel channel = GetConfiguredChannels().FirstOrDefault(c =>
-                ResourceIdentity.SystemMatches(c.System, systemName) && c.Tgid == tgid);
-            return uint.TryParse(channel?.GetSourceRid(system) ?? system.Rid, out uint rid) ? rid : 0;
+            return uint.TryParse(channel.GetSourceRid(system), out uint rid) ? rid : 0;
         }
 
         /// <summary>
@@ -7528,139 +7439,28 @@ namespace dvmconsole
         /// </summary>
         /// <param name="sender"></param>
         /// <param name="e"></param>
-        private async void GlobalPTTActivate(object sender, RoutedEventArgs e)
+        private void GlobalPTTActivate(object sender, RoutedEventArgs e)
         {
-            if (globalPttState)
-                await Task.Delay(500);
-
-            if (globalPttState && !CanStartPttOutsidePatchEditMode())
+            if (!globalPttState)
             {
-                globalPttState = false;
-                Dispatcher.Invoke(() => SetGlobalPttVisualState(false));
-                return;
+                foreach (ChannelBox target in globalMousePttTargets)
+                    target.SetPttInput(globalMousePttOwner, false);
+                globalMousePttTargets.Clear();
             }
-
-            if (globalPttState)
-                EnsureAudioInputCaptureHealthy("global PTT start");
-
-            if (globalPttState)
-                ApplyRxPlaybackMuteForTransmitStart();
-
-            ChannelBox primaryChannel = selectedChannelsManager.PrimaryChannel;
-
-            if (primaryChannel != null)
+            else if (globalMousePttTargets.Count == 0)
             {
-                if (globalPttState && primaryChannel.IsRxOnly)
-                {
+                foreach (ChannelBox target in ResolvePrimaryPttTargets())
+                    if (target.SetPttInput(globalMousePttOwner, true))
+                        globalMousePttTargets.Add(target);
+                if (globalMousePttTargets.Count == 0)
                     globalPttState = false;
-                    Dispatcher.Invoke(() => SetGlobalPttVisualState(false));
-                    return;
-                }
-
-                Dispatcher.Invoke(() =>
-                {
-                    if (globalPttState)
-                        SetGlobalPttVisualState(true);
-                    else
-                        SetGlobalPttVisualState(false);
-                });
-                
-                primaryChannel.TriggerPTTState(globalPttState);
-                if (globalPttState && !primaryChannel.PttState)
-                {
-                    globalPttState = false;
-                    Dispatcher.Invoke(() => SetGlobalPttVisualState(false));
-                }
-
-                return;
             }
-
-            
-            // Check for global PTT keys all preference, if not enabled, return early
-            if (!settingsManager.GlobalPTTKeysAllChannels)
-            {
-                return;
-            }
-
-            bool anyGlobalPttChannelStarted = false;
-            foreach (ChannelBox channel in selectedChannelsManager.GetSelectedChannels())
-            {
-                if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
-                    continue;
-                if (globalPttState && channel.IsRxOnly)
-                    continue;
-                if (globalPttState && !CanStartChannelPtt(channel, showWarning: false))
-                    continue;
-
-                Codeplug.System system = Codeplug.GetSystemForChannel(channel.ChannelName);
-                if (system == null)
-                {
-                    Log.WriteLine($"{channel.ChannelName} refers to an {INVALID_SYSTEM} {channel.SystemName}. {ERR_INVALID_CODEPLUG}.");
-                    channel.IsSelected = false;
-                    selectedChannelsManager.RemoveSelectedChannel(channel);
-                    continue;
-                }
-
-                Codeplug.Channel cpgChannel = Codeplug.GetChannelByName(channel.ChannelName);
-                if (cpgChannel == null)
-                {
-                    Log.WriteLine($"{channel.ChannelName} refers to an {INVALID_CODEPLUG_CHANNEL}. {ERR_INVALID_CODEPLUG}.");
-                    channel.IsSelected = false;
-                    selectedChannelsManager.RemoveSelectedChannel(channel);
-                    continue;
-                }
-
-                PeerSystem fne = fneSystemManager.GetFneSystem(system.Name);
-                if (fne == null)
-                {
-                    if (TryHandleDisconnectedFneEndpoint(channel, system, $"Global PTT {channel.ChannelName}"))
-                    {
-                        channel.PttState = false;
-                        channel.VolumeMeterLevel = 0;
-                        ResetChannel(channel);
-                        continue;
-                    }
-
-                    Log.WriteLine($"{channel.ChannelName} has a {ERR_INVALID_FNE_REF}. {ERR_INVALID_CODEPLUG}.");
-                    channel.IsSelected = false;
-                    selectedChannelsManager.RemoveSelectedChannel(channel);
-                    continue;
-                }
-
-                if (globalPttState)
-                {
-                    Dispatcher.Invoke(() =>
-                    {
-                        SetGlobalPttVisualState(true);
-                    });
-                }
-                else
-                {
-                    Dispatcher.Invoke(() =>
-                    {
-                        SetGlobalPttVisualState(false);
-                    });
-                }
-
-                channel.TriggerPTTState(globalPttState);
-                if (!globalPttState || channel.PttState)
-                    anyGlobalPttChannelStarted = true;
-            }
-
-            if (globalPttState && !anyGlobalPttChannelStarted)
-            {
-                globalPttState = false;
-                Dispatcher.Invoke(() => SetGlobalPttVisualState(false));
-                MessageBox.Show(FNE_DISCONNECTED_MESSAGE, "FNE Disconnected", MessageBoxButton.OK, MessageBoxImage.Warning);
-            }
+            RefreshGlobalPttIndicator();
         }
 
         /// <summary>
-        /// 
+        /// Toggles the global mouse PTT in momentary mode.
         /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        /// <exception cref="NotImplementedException"></exception>
         private void btnGlobalPtt_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
         {
             if (settingsManager.TogglePTTMode)
@@ -7779,9 +7579,7 @@ namespace dvmconsole
 
             List<ChannelBox> tabChannels = activeCanvas.Children
                 .OfType<ChannelBox>()
-                .Where(channel => channel.SystemName != PLAYBACKSYS &&
-                                  channel.ChannelName != PLAYBACKCHNAME &&
-                                  channel.DstId != PLAYBACKTG)
+                .Where(channel => !channel.IsLocalPlayback)
                 .ToList();
 
             if (tabChannels.Count == 0)
@@ -7795,7 +7593,7 @@ namespace dvmconsole
             {
                 foreach (ChannelBox channel in tabChannels)
                 {
-                    Codeplug.System system = Codeplug.GetSystemForChannel(channel.ChannelName);
+                    Codeplug.System system = Codeplug.GetSystemForChannel(channel.ConfiguredChannel);
                     if (system == null)
                     {
                         Log.WriteLine($"{channel.ChannelName} refers to an {INVALID_SYSTEM} {channel.SystemName}. {ERR_INVALID_CODEPLUG}.");
@@ -7804,7 +7602,7 @@ namespace dvmconsole
                         continue;
                     }
 
-                    Codeplug.Channel cpgChannel = Codeplug.GetChannelByName(channel.ChannelName);
+                    Codeplug.Channel cpgChannel = channel.ConfiguredChannel;
                     if (cpgChannel == null)
                     {
                         Log.WriteLine($"{channel.ChannelName} refers to an {INVALID_CODEPLUG_CHANNEL}. {ERR_INVALID_CODEPLUG}.");
@@ -7940,249 +7738,38 @@ namespace dvmconsole
         /// <param name="e"></param>
         public void KeyResponseReceived(KeyResponseEvent e, string sourceSystemName = null)
         {
-            ImportNxdnNetworkKeys(e, sourceSystemName);
-            //Log.WriteLine($"Message ID: {e.KmmKey.MessageId}");
-            //Log.WriteLine($"Decrypt Info Format: {e.KmmKey.DecryptInfoFmt}");
-            //Log.WriteLine($"Algorithm ID: {e.KmmKey.AlgId}");
-            //Log.WriteLine($"Key ID: {e.KmmKey.KeyId}");
-            //Log.WriteLine($"Keyset ID: {e.KmmKey.KeysetItem.KeysetId}");
-            //Log.WriteLine($"Keyset Alg ID: {e.KmmKey.KeysetItem.AlgId}");
-            //Log.WriteLine($"Keyset Key Length: {e.KmmKey.KeysetItem.KeyLength}");
-            //Log.WriteLine($"Number of Keys: {e.KmmKey.KeysetItem.Keys.Count}");
+            if (e?.KmmKey?.KeysetItem?.Keys == null || string.IsNullOrWhiteSpace(sourceSystemName))
+                return;
 
-            foreach (var key in e.KmmKey.KeysetItem.Keys)
+            Dispatcher.Invoke(() =>
             {
-                //Log.WriteLine($"  Key Format: {key.KeyFormat}");
-                //Log.WriteLine($"  SLN: {key.Sln}");
-                //Log.WriteLine($"  Key ID: {key.KeyId}");
-                //Log.WriteLine($"  Key Data: {BitConverter.ToString(key.GetKey())}");
+                if (!(Codeplug?.Systems?.Any(system => ResourceIdentity.SystemMatches(system.Name, sourceSystemName)) ?? false))
+                    return;
 
-                Dispatcher.Invoke(() =>
+                KeysetItem received = e.KmmKey.KeysetItem;
+                foreach (var key in received.Keys)
                 {
-                    foreach (ChannelBox channel in selectedChannelsManager.GetSelectedChannels())
-                    {
-                        if (channel.SystemName == PLAYBACKSYS || channel.ChannelName == PLAYBACKCHNAME || channel.DstId == PLAYBACKTG)
-                            continue;
-
-                        Codeplug.System system = Codeplug.GetSystemForChannel(channel.ChannelName);
-                        if (system == null)
-                        {
-                            Log.WriteLine($"{channel.ChannelName} refers to an {INVALID_SYSTEM} {channel.SystemName}. {ERR_INVALID_CODEPLUG}.");
-                            channel.IsSelected = false;
-                            selectedChannelsManager.RemoveSelectedChannel(channel);
-                            continue;
-                        }
-
-                        Codeplug.Channel cpgChannel = Codeplug.GetChannelByName(channel.ChannelName);
-                        if (cpgChannel == null)
-                        {
-                            Log.WriteLine($"{channel.ChannelName} refers to an {INVALID_CODEPLUG_CHANNEL}. {ERR_INVALID_CODEPLUG}.");
-                            channel.IsSelected = false;
-                            selectedChannelsManager.RemoveSelectedChannel(channel);
-                            continue;
-                        }
-
-                        KeysetItem receivedKey = e.KmmKey.KeysetItem;
-
-                        if (sourceSystemName != null && !ResourceIdentity.SystemMatches(sourceSystemName, system.Name))
-                            continue;
-
-                        if (cpgChannel.GetChannelMode() != Codeplug.ChannelMode.P25)
-                            continue;
-
-                        ushort keyId = cpgChannel.GetKeyId();
-                        byte algoId = cpgChannel.GetAlgoId();
-                        if (keyId != 0 && algoId != 0 && keyId == key.KeyId && algoId == receivedKey.AlgId)
-                            channel.Crypter.SetKey(key.KeyId, receivedKey.AlgId, key.GetKey());
-                    }
-                });
-            }
+                    if (key != null && !networkKeys.Store(sourceSystemName, received.AlgId, key.KeyId, key.GetKey()))
+                        Log.WriteWarning($"({sourceSystemName}) Ignoring unsupported key ALGID {received.AlgId} KID {key.KeyId}.");
+                }
+                ImportNxdnNetworkKeys(e, sourceSystemName);
+                foreach (ChannelBox channel in selectedChannelsManager.GetSelectedChannels())
+                {
+                    Codeplug.Channel config = channel.ConfiguredChannel;
+                    if (config != null && ResourceIdentity.SystemMatches(config.System, sourceSystemName))
+                        ApplyP25TransmitKey(channel, config);
+                }
+            });
         }
 
         /** Keyboard Shortcuts */
 
         /// <summary>
-        /// Sets the global PTT keybind
-        /// Hooks a listener to listen for a keypress, then saves that as the global PTT keybind
-        /// Global PTT keybind is effectively the same as pressing the Global PTT button
+        /// Toggles the fallback used when no Ctrl-click primary resource is selected.
         /// </summary>
         /// <param name="sender"></param>
         /// <param name="e"></param>
         /// <exception cref="NotImplementedException"></exception>
-        private async void SetGlobalPTTKeybind(object sender, RoutedEventArgs e)
-        {
-            
-            // Create and show a MessageBox with no buttons or standard close behavior
-            Window messageBox = new Window
-            {
-                Width = 500,
-                Height = 150,
-                WindowStyle = WindowStyle.None,
-                ShowInTaskbar = false,
-                ResizeMode = ResizeMode.NoResize,
-                Topmost = true,
-                Background = System.Windows.Media.Brushes.White,
-                Content = new System.Windows.Controls.TextBlock
-                {
-                    Text = "Press any key to set the Global PTT shortcut...",
-                    HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
-                    VerticalAlignment = System.Windows.VerticalAlignment.Center,
-                    FontSize = 16,
-                    FontWeight = System.Windows.FontWeights.Bold,
-                }
-            };
-
-            // Center messageBox on the main window
-            messageBox.Owner = this; // Set the current window as owner
-            messageBox.WindowStartupLocation = WindowStartupLocation.CenterOwner;
-
-            // Open and close the MessageBox after 500ms
-            messageBox.Show();
-            Keys keyPress = await keyboardManager.GetNextKeyPress();
-            messageBox.Close();
-            settingsManager.GlobalPTTShortcut = keyPress;
-            InitializeKeyboardShortcuts();
-            settingsManager.SaveSettings();
-            MessageBox.Show("Global PTT shortcut set to " + keyPress.ToString(), "Success", MessageBoxButton.OK, MessageBoxImage.Information);
-        }
-
-        /// <summary>
-        /// Initializes global keyboard shortcut listener
-        /// </summary>
-        private void InitializeKeyboardShortcuts()
-        {
-            CancelKeyboardPttWatchdog();
-            keyboardPttShortcutDown = false;
-
-            var listeningKeys = new List<Keys> { settingsManager.GlobalPTTShortcut };
-            keyboardManager.SetListenKeys(listeningKeys);
-            // Clear event listener
-            keyboardManager.OnKeyEvent -= KeyboardManagerOnKeyEvent;
-            // Re-add listener
-            keyboardManager.OnKeyEvent += KeyboardManagerOnKeyEvent;
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="pressedKey"></param>
-        /// <param name="state"></param>
-        private void KeyboardManagerOnKeyEvent(Keys pressedKey, GlobalKeyboardHook.KeyboardState state)
-        {
-            if (settingsManager.GlobalPTTShortcut == Keys.None || pressedKey != settingsManager.GlobalPTTShortcut)
-                return;
-
-            bool keyDown = state is GlobalKeyboardHook.KeyboardState.KeyDown or GlobalKeyboardHook.KeyboardState.SysKeyDown;
-            bool keyUp = state is GlobalKeyboardHook.KeyboardState.KeyUp or GlobalKeyboardHook.KeyboardState.SysKeyUp;
-
-            if (settingsManager.TogglePTTMode)
-            {
-                if (keyDown)
-                {
-                    if (keyboardPttShortcutDown)
-                        return;
-
-                    keyboardPttShortcutDown = true;
-                    globalPttState = !globalPttState;
-                    GlobalPTTActivate(null, null);
-                    StartKeyboardPttWatchdog(pressedKey, releasePttWhenKeyReleased: false);
-                }
-                else if (keyUp)
-                {
-                    keyboardPttShortcutDown = false;
-                    CancelKeyboardPttWatchdog();
-                }
-
-                return;
-            }
-
-            if (keyDown)
-            {
-                if (keyboardPttShortcutDown)
-                    return;
-
-                keyboardPttShortcutDown = true;
-                globalPttState = true;
-                GlobalPTTActivate(null, null);
-                StartKeyboardPttWatchdog(pressedKey, releasePttWhenKeyReleased: true);
-            }
-            else if (keyUp)
-            {
-                ReleaseKeyboardPtt(force: false);
-            }
-        }
-
-        private void StartKeyboardPttWatchdog(Keys shortcutKey, bool releasePttWhenKeyReleased)
-        {
-            CancelKeyboardPttWatchdog();
-
-            CancellationTokenSource cancelToken = new CancellationTokenSource();
-            keyboardPttWatchdogCancelToken = cancelToken;
-
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    while (!cancelToken.IsCancellationRequested)
-                    {
-                        await Task.Delay(KeyboardPttWatchdogInterval, cancelToken.Token).ConfigureAwait(false);
-
-                        if (IsShortcutKeyPhysicallyDown(shortcutKey))
-                            continue;
-
-                        Dispatcher.BeginInvoke(new Action(() =>
-                        {
-                            if (releasePttWhenKeyReleased)
-                            {
-                                Log.WriteWarning("Global PTT shortcut key-up was missed; forcing PTT release.");
-                                ReleaseKeyboardPtt(force: true);
-                            }
-                            else
-                            {
-                                keyboardPttShortcutDown = false;
-                                CancelKeyboardPttWatchdog();
-                            }
-                        }));
-
-                        return;
-                    }
-                }
-                catch (TaskCanceledException)
-                {
-                    /* expected when key-up is observed normally */
-                }
-            });
-        }
-
-        private void ReleaseKeyboardPtt(bool force)
-        {
-            keyboardPttShortcutDown = false;
-            CancelKeyboardPttWatchdog();
-
-            if (!globalPttState && !force)
-                return;
-
-            globalPttState = false;
-            GlobalPTTActivate(null, null);
-        }
-
-        private void CancelKeyboardPttWatchdog()
-        {
-            CancellationTokenSource cancelToken = keyboardPttWatchdogCancelToken;
-            keyboardPttWatchdogCancelToken = null;
-            cancelToken?.Cancel();
-        }
-
-        private static bool IsShortcutKeyPhysicallyDown(Keys shortcutKey)
-        {
-            return (GetAsyncKeyState((int)shortcutKey) & 0x8000) != 0;
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
         private void ToggleGlobalPTTAllChannels_Click(object sender, RoutedEventArgs e)
         {
             settingsManager.GlobalPTTKeysAllChannels = !settingsManager.GlobalPTTKeysAllChannels;
